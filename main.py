@@ -24,6 +24,64 @@ handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
+# 中文日志过滤器（按需将常见英文片段替换为中文）
+LOG_LANG = os.getenv("LOG_LANG", "zh").lower()
+if LOG_LANG in ("zh", "zh-cn", "chinese"):
+    class CnLogFilter(logging.Filter):
+        MAP = {
+            "Starting K-line Momentum bot": "启动K线动量机器人（交易所侧条件单）",
+            "Starting main monitor loop. Symbols:": "开始主监控循环。交易对：",
+            "fetch_ohlcv error": "获取K线错误",
+            "fetch_ohlcv failed for": "获取K线失败：",
+            "insufficient data for timeframe": "该周期数据不足，跳过",
+            "ATR invalid": "ATR无效，跳过",
+            "SIGNAL BUY": "信号 买入",
+            "SIGNAL SELL": "信号 卖出",
+            "Placing market entry": "执行市价入场",
+            "Attached TP/SL to entry order via ccxt params.": "已在下单时同步附加交易所侧止盈/止损",
+            "Entry executed:": "入场成交：",
+            "Entry TP/SL attached at order creation; skipping separate conditional orders.": "入场时已附加TP/SL；跳过后续单独创建",
+            "position opened and protective orders placed.": "持仓已建立且保护单已处理",
+            "failed to open position": "开仓失败",
+            "market order creation raised": "创建市价单异常",
+            "conditional create (try1) failed": "条件单创建（方案1）失败",
+            "conditional create (try2) failed": "条件单创建（方案2）失败",
+            "All conditional-order attempts failed": "所有条件单创建方案均失败",
+            "detected existing exchange TP/SL; skip re-attach.": "检测到交易所已有保护单；不再重复附加",
+            "no existing exchange TP/SL detected; will consider first attach if not attempted.": "未检测到保护单；若未尝试过将首次附加",
+            "first attach TP/SL planned:": "计划首次附加TP/SL：",
+            "attached exchange-side TP/SL after entry (once).": "已在入场后附加TP/SL（一次性）",
+            "dynamic check: enabled": "动态检查：已启用",
+            "dynamically updated exchange-side TP/SL (old canceled).": "已动态更新交易所侧TP/SL（已先撤旧单）",
+            "dynamic TP/SL update failed": "动态更新TP/SL失败",
+            "dynamic TP/SL disabled by config; skipping update.": "已通过配置禁用动态TP/SL；跳过更新",
+            "local SL hit for long": "本地止损触发（多单）",
+            "local TP hit for long": "本地止盈触发（多单）",
+            "local SL hit for short": "本地止损触发（空单）",
+            "local TP hit for short": "本地止盈触发（空单）",
+            "Free USDT balance is zero or couldn't fetch. Sleeping.": "可用USDT余额为0或获取失败。休眠中……",
+            "fetch_balance attempt": "获取余额重试",
+            "Unable to reliably fetch balance": "无法稳定获取余额",
+            "order amount clamped to exchange max amount": "下单数量已按交易所上限收敛，避免 51202",
+            "trailing refs:": "跟踪止损参考：",
+            "local SL/TP fallback check error": "本地SL/TP兜底检查错误",
+            "error closing position on reverse": "反向信号平仓错误",
+            "Fatal exception": "致命异常",
+            "KeyboardInterrupt received. Exiting.": "接收到中断信号，退出。",
+        }
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+                for en, zh in self.MAP.items():
+                    if en in msg:
+                        msg = msg.replace(en, zh)
+                record.msg = msg
+                record.args = ()
+            except Exception:
+                pass
+            return True
+    handler.addFilter(CnLogFilter())
+
 # ----------------------------
 # Basic config (can edit)
 # ----------------------------
@@ -146,6 +204,59 @@ positions = {}  # symbol -> position dict (local state)
 #   'opened_at': datetime,
 #   'atr_sl_value': float,
 # }
+
+# 运行统计：累计已实现盈亏、平仓数与胜率
+stats = {
+    'realized_pnl': 0.0,
+    'closed_count': 0,
+    'wins': 0,
+    'losses': 0,
+}
+last_summary_ts = 0
+
+def compute_unrealized_pnl(symbol: str, p: dict, last_px: float) -> float:
+    try:
+        qty = float(p.get('qty') or 0)
+        entry = float(p.get('entry_price') or 0)
+        if qty <= 0 or entry <= 0 or last_px is None:
+            return 0.0
+        if p.get('side') == 'buy':
+            return (last_px - entry) * qty
+        else:
+            return (entry - last_px) * qty
+    except Exception:
+        return 0.0
+
+def update_stats_on_close(symbol: str, p: dict, close_px: float, reason: str):
+    global stats
+    pnl = compute_unrealized_pnl(symbol, p, close_px)
+    stats['realized_pnl'] += pnl
+    stats['closed_count'] += 1
+    if pnl >= 0:
+        stats['wins'] += 1
+    else:
+        stats['losses'] += 1
+    winrate = (stats['wins'] / stats['closed_count'] * 100.0) if stats['closed_count'] > 0 else 0.0
+    logger.info(f"{symbol} 已平仓（原因：{reason}），本单已实现盈亏={pnl:.6f}，累计已实现盈亏={stats['realized_pnl']:.6f}，胜率={winrate:.2f}%（{stats['wins']}/{stats['closed_count']}）")
+
+def log_summary(free_usdt: float):
+    # 输出账户与持仓看板
+    try:
+        winrate = (stats['wins'] / stats['closed_count'] * 100.0) if stats['closed_count'] > 0 else 0.0
+        logger.info(f"账户看板：可用USDT（合约）={free_usdt:.4f}，累计已实现盈亏={stats['realized_pnl']:.6f}，总平仓={stats['closed_count']}，胜率={winrate:.2f}%（胜/总={stats['wins']}/{stats['closed_count']}）")
+        if positions:
+            for sym, p in positions.items():
+                try:
+                    tk = exchange.fetch_ticker(sym)
+                    last_px = tk.get('last') if tk and 'last' in tk else None
+                except Exception:
+                    last_px = None
+                upnl = compute_unrealized_pnl(sym, p, last_px if last_px is not None else p.get('entry_price'))
+                logger.info(f"持仓：{sym} 方向={p.get('side')} 数量={p.get('qty')} 入场={p.get('entry_price')} 最新={last_px} 未实现盈亏={upnl:.6f} SL={p.get('sl_price')} TP={p.get('tp_price')}")
+        else:
+            logger.info("当前无持仓。")
+    except Exception as e:
+        logger.debug(f"输出账户看板时异常：{e}")
 
 # ----------------------------
 # Account helpers
@@ -431,6 +542,7 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
                 'sl_order': None,
                 'tp_order': None,
                 'tp_sl_attached': True,
+                'tp_sl_updated_at': datetime.now(timezone.utc).isoformat(),
             }
             return result
 
@@ -630,6 +742,13 @@ def monitor_and_run():
                             qty = pos.get('qty')
                             if qty and float(qty) > 0:
                                 exchange.create_market_order(symbol, 'sell', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'long'})
+                            # 统计已实现盈亏
+                            try:
+                                tkc = exchange.fetch_ticker(symbol)
+                                close_px = tkc.get('last') if tkc and 'last' in tkc else pos.get('entry_price')
+                            except Exception:
+                                close_px = pos.get('entry_price')
+                            update_stats_on_close(symbol, pos, close_px, "反向信号（多→空）")
                             # cancel conditional orders if any
                             if pos.get('sl_order_id'):
                                 try:
@@ -651,6 +770,12 @@ def monitor_and_run():
                             qty = pos.get('qty')
                             if qty and float(qty) > 0:
                                 exchange.create_market_order(symbol, 'buy', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'short'})
+                            try:
+                                tkc = exchange.fetch_ticker(symbol)
+                                close_px = tkc.get('last') if tkc and 'last' in tkc else pos.get('entry_price')
+                            except Exception:
+                                close_px = pos.get('entry_price')
+                            update_stats_on_close(symbol, pos, close_px, "反向信号（空→多）")
                             if pos.get('sl_order_id'):
                                 try:
                                     exchange.cancel_order(pos['sl_order_id'], symbol, params={})
@@ -697,6 +822,7 @@ def monitor_and_run():
                             'tp_price': tp_price,
                             'tp_sl_attached': bool(res.get('tp_sl_attached', False)),
                             'tp_sl_attempted': bool(res.get('tp_sl_attached', False)),
+                            'tp_sl_updated_at': (res.get('tp_sl_updated_at') or (datetime.now(timezone.utc).isoformat() if res.get('tp_sl_attached') else None)),
                             # 跟踪止损锚点
                             'highest_since_entry': entry_price if side == 'buy' else None,
                             'lowest_since_entry': entry_price if side == 'sell' else None,
@@ -749,14 +875,18 @@ def monitor_and_run():
 
                             # 以 ATR*TRAIL_MULT 作为跟踪距离
                             trail_dist = float(atr_latest) * float(TRAIL_MULT)
+                            trail_sl_candidate = None
                             if p.get('side') == 'buy' and p.get('highest_since_entry'):
                                 trail_sl = float(p['highest_since_entry']) - trail_dist
+                                trail_sl_candidate = trail_sl
                                 # 只上移，不下移
                                 desired_sl = max(desired_sl, trail_sl)
                             elif p.get('side') == 'sell' and p.get('lowest_since_entry'):
                                 trail_sl = float(p['lowest_since_entry']) + trail_dist
+                                trail_sl_candidate = trail_sl
                                 # 只下移，不上移
                                 desired_sl = min(desired_sl, trail_sl)
+                            logger.info(f"{symbol} trailing refs: side={p.get('side')}, highest={p.get('highest_since_entry')}, lowest={p.get('lowest_since_entry')}, atr={atr_latest}, trail_mult={TRAIL_MULT}, trail_dist={trail_dist}, trail_sl_candidate={trail_sl_candidate}, desired_sl={desired_sl}")
 
                         # 1) Attach once if not yet attached and not attempted
                         if (not p.get('tp_sl_attached')) and (not p.get('tp_sl_attempted')):
@@ -840,7 +970,7 @@ def monitor_and_run():
                                     if isinstance(sl_o, dict): p['sl_order_id'] = sl_o.get('id') or sl_o.get('algoId') or sl_o.get('order_id')
                                     if isinstance(tp_o, dict): p['tp_order_id'] = tp_o.get('id') or tp_o.get('algoId') or tp_o.get('order_id')
                                     p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
-                                    p['tp_sl_updated_at'] = datetime.now(datetime.UTC).isoformat()
+                                    p['tp_sl_updated_at'] = datetime.now(timezone.utc).isoformat()
                                     logger.info(f"{symbol} dynamically updated exchange-side TP/SL (old canceled).")
                                 except Exception as ex_upd:
                                     logger.warning(f"{symbol} dynamic TP/SL update failed: {ex_upd}")
@@ -864,6 +994,7 @@ def monitor_and_run():
                                             exchange.create_market_order(symbol, 'sell', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'long'})
                                         except Exception as e:
                                             logger.error(f"{symbol} local SL close error: {e}")
+                                    update_stats_on_close(symbol, p, last_px, "本地止损（多）")
                                     # best-effort cancel protective orders
                                     for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
                                         if oid:
@@ -880,6 +1011,7 @@ def monitor_and_run():
                                             exchange.create_market_order(symbol, 'sell', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'long'})
                                         except Exception as e:
                                             logger.error(f"{symbol} local TP close error: {e}")
+                                    update_stats_on_close(symbol, p, last_px, "本地止盈（多）")
                                     for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
                                         if oid:
                                             try:
@@ -897,6 +1029,7 @@ def monitor_and_run():
                                             exchange.create_market_order(symbol, 'buy', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'short'})
                                         except Exception as e:
                                             logger.error(f"{symbol} local SL close error: {e}")
+                                    update_stats_on_close(symbol, p, last_px, "本地止损（空）")
                                     for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
                                         if oid:
                                             try:
@@ -912,6 +1045,7 @@ def monitor_and_run():
                                             exchange.create_market_order(symbol, 'buy', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'short'})
                                         except Exception as e:
                                             logger.error(f"{symbol} local TP close error: {e}")
+                                    update_stats_on_close(symbol, p, last_px, "本地止盈（空）")
                                     for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
                                         if oid:
                                             try:
@@ -941,6 +1075,13 @@ def monitor_and_run():
                             if status and str(status).lower() in ('closed','filled','triggered','filled_with_trigger','filled'):
                                 # one of protective orders triggered -> close position local and cancel other protective order if exists
                                 logger.info(f"{symbol} protective order {key} executed (status={status}). Cleaning up local position.")
+                                # 统计已实现盈亏（以当前价近似）
+                                try:
+                                    tkf = exchange.fetch_ticker(symbol)
+                                    close_px = tkf.get('last') if tkf and 'last' in tkf else p.get('entry_price')
+                                except Exception:
+                                    close_px = p.get('entry_price')
+                                update_stats_on_close(symbol, p, close_px, f"保护单触发（{key}）")
                                 # cancel counterpart if exists
                                 other = 'tp_order_id' if key == 'sl_order_id' else 'sl_order_id'
                                 other_id = p.get(other)
@@ -961,6 +1102,21 @@ def monitor_and_run():
                 logger.error(f"Error processing {symbol}: {e}\n{traceback.format_exc()}")
 
         # End for symbols
+
+        # 每60秒输出一次账户与持仓看板
+        try:
+            global last_summary_ts
+            now_ts = time.time()
+            if now_ts - last_summary_ts >= 60:
+                # 重新取一次余额用于看板
+                try:
+                    free_usdt_summary = get_free_balance_usdt()
+                except Exception:
+                    free_usdt_summary = 0.0
+                log_summary(free_usdt_summary)
+                last_summary_ts = now_ts
+        except Exception as _e:
+            logger.debug(f"汇总看板输出异常：{_e}")
 
         # Sleep until next tick (but keep loop responsive)
         elapsed = time.time() - start_ts
