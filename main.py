@@ -55,6 +55,7 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # fraction of accou
 MIN_ORDER_USDT = float(os.getenv("MIN_ORDER_USDT", "1.0"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.0008"))  # slippage / fees approx
 SANDBOX = os.getenv("SANDBOX", "false").lower() in ("1", "true", "yes")
+DYNAMIC_TPSL = os.getenv("DYNAMIC_TPSL", "true").lower() in ("1", "true", "yes")
 
 # Fetch / timing
 BARS_LIMIT = 200
@@ -365,6 +366,7 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
                 'entry_price': entry_price,
                 'sl_order': None,
                 'tp_order': None,
+                'tp_sl_attached': True,
             }
             return result
 
@@ -448,6 +450,7 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             'entry_price': entry_price,
             'sl_order': sl_order,
             'tp_order': tp_order,
+            'tp_sl_attached': True if (sl_order or tp_order) else False,
         }
         return result
 
@@ -623,11 +626,13 @@ def monitor_and_run():
                             'qty': filled_qty,
                             'sl_order': sl_order,
                             'tp_order': tp_order,
-                            'opened_at': datetime.utcnow().isoformat(),
+                            'opened_at': datetime.now(datetime.UTC).isoformat(),
                             'atr_sl_value': current_atr * atr_mult_sl,
                             'atr_val': current_atr,
                             'sl_price': sl_price,
                             'tp_price': tp_price,
+                            'tp_sl_attached': bool(res.get('tp_sl_attached', False)),
+                            'tp_sl_attempted': bool(res.get('tp_sl_attached', False)),
                             'cfg': cfg
                         }
                         logger.info(f"{symbol} position opened and protective orders placed.")
@@ -638,9 +643,59 @@ def monitor_and_run():
 
                 # Optionally: monitor existing conditional orders status, if they triggered -> cleanup
                 if positions.get(symbol):
-                    # local SL/TP fallback protection: if exchange conditional orders not working, enforce locally
+                    # attach/update exchange-side TP/SL exactly-once; avoid duplicates; dynamic update cancels previous first
+                    p = positions[symbol]
                     try:
-                        p = positions[symbol]
+                        # compute desired SL/TP based on latest ATR but original entry price and per-symbol config
+                        atr_latest = compute_atr(df, ATR_PERIOD).iloc[-1]
+                        desired_sl, desired_tp, _, _ = calc_sl_tp(p['entry_price'], p['side'], atr_latest, p['cfg'][2], p['cfg'][3])
+
+                        # 1) Attach once if not yet attached and not attempted
+                        if (not p.get('tp_sl_attached')) and (not p.get('tp_sl_attempted')):
+                            pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
+                            try:
+                                sl_params_once = {'triggerPrice': float(desired_sl), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
+                                tp_params_once = {'triggerPrice': float(desired_tp), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
+                                sl_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=sl_params_once)
+                                tp_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=tp_params_once)
+                                p['sl_order'] = sl_o; p['tp_order'] = tp_o
+                                if isinstance(sl_o, dict): p['sl_order_id'] = sl_o.get('id') or sl_o.get('algoId') or sl_o.get('order_id')
+                                if isinstance(tp_o, dict): p['tp_order_id'] = tp_o.get('id') or tp_o.get('algoId') or tp_o.get('order_id')
+                                p['tp_sl_attached'] = True
+                                p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
+                                logger.info(f"{symbol} attached exchange-side TP/SL after entry (once).")
+                            except Exception as ex_attach_once:
+                                logger.warning(f"{symbol} attach TP/SL after entry failed: {ex_attach_once}")
+                            finally:
+                                p['tp_sl_attempted'] = True
+
+                        # 2) Dynamic update: if enabled and prices changed materially, cancel old and re-place new
+                        elif DYNAMIC_TPSL and p.get('tp_sl_attached'):
+                            eps = max(1e-8, abs(p.get('sl_price', desired_sl)) * 0.0005)
+                            changed = (abs(desired_sl - p.get('sl_price', desired_sl)) > eps) or (abs(desired_tp - p.get('tp_price', desired_tp)) > eps)
+                            if changed:
+                                # cancel previous protective orders if we have ids
+                                for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
+                                    if oid:
+                                        try:
+                                            exchange.cancel_order(oid, symbol, params={})
+                                        except Exception:
+                                            pass
+                                pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
+                                try:
+                                    sl_params_upd = {'triggerPrice': float(desired_sl), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
+                                    tp_params_upd = {'triggerPrice': float(desired_tp), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
+                                    sl_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=sl_params_upd)
+                                    tp_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=tp_params_upd)
+                                    p['sl_order'] = sl_o; p['tp_order'] = tp_o
+                                    if isinstance(sl_o, dict): p['sl_order_id'] = sl_o.get('id') or sl_o.get('algoId') or sl_o.get('order_id')
+                                    if isinstance(tp_o, dict): p['tp_order_id'] = tp_o.get('id') or tp_o.get('algoId') or tp_o.get('order_id')
+                                    p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
+                                    logger.info(f"{symbol} dynamically updated exchange-side TP/SL (old canceled).")
+                                except Exception as ex_upd:
+                                    logger.warning(f"{symbol} dynamic TP/SL update failed: {ex_upd}")
+
+                        # continue with local fallback checks below
                         ticker_now = exchange.fetch_ticker(symbol)
                         last_px = ticker_now.get('last') if ticker_now and 'last' in ticker_now else None
                         if last_px is None:
