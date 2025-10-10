@@ -922,6 +922,124 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             filled_qty = qty
 
         logger.info(f"Entry executed: filled_qty={filled_qty}, entry_price={entry_price}")
+        # 仅当确认成交且交易所存在真实持仓时才创建保护单，避免“未下单却建止盈止损”
+        try:
+            if not filled_qty or float(filled_qty) <= 0:
+                logger.warning(f"{symbol} 入场未成交或数量为0，跳过保护单创建。")
+                return {
+                    'entry_order': order,
+                    'filled_qty': filled_qty or 0,
+                    'entry_price': entry_price,
+                    'sl_order': None,
+                    'tp_order': None,
+                    'tp_sl_attached': False,
+                }
+            # 校验交易所持仓是否存在（SWAP）
+            pos_side_flag_check = 'long' if side == 'buy' else 'short'
+            has_real_position = False
+            try:
+                ex_positions = []
+                try:
+                    ex_positions = exchange.fetch_positions(params={'instType': 'SWAP'}) or []
+                except Exception:
+                    ex_positions = exchange.fetch_positions() or []
+                for px in ex_positions:
+                    psym = px.get('symbol')
+                    if psym != symbol:
+                        info = px.get('info') or {}
+                        inst_id = info.get('instId') or info.get('inst_id')
+                        if inst_id and hasattr(exchange, 'markets_by_id'):
+                            m = exchange.markets_by_id.get(inst_id)
+                            psym = m.get('symbol') if m else None
+                    side_ccxt = (px.get('side') or '').lower()
+                    if psym == symbol and ((pos_side_flag_check == 'long' and side_ccxt == 'long') or (pos_side_flag_check == 'short' and side_ccxt == 'short')):
+                        contracts = float(px.get('contracts') or px.get('positionAmt') or px.get('contractsAbs') or 0)
+                        if contracts > 0:
+                            has_real_position = True
+                            break
+            except Exception:
+                has_real_position = False
+            if not has_real_position:
+                logger.warning(f"{symbol} 交易所未发现真实持仓（posSide={pos_side_flag_check}），跳过保护单创建。")
+                return {
+                    'entry_order': order,
+                    'filled_qty': filled_qty,
+                    'entry_price': entry_price,
+                    'sl_order': None,
+                    'tp_order': None,
+                    'tp_sl_attached': False,
+                }
+        except Exception:
+            # 若校验异常，稳妥起见也跳过保护单创建
+            return {
+                'entry_order': order,
+                'filled_qty': filled_qty,
+                'entry_price': entry_price,
+                'sl_order': None,
+                'tp_order': None,
+                'tp_sl_attached': False,
+            }
+        # 仅当确认成交且交易所存在真实持仓时才创建保护单
+        try:
+            if not filled_qty or float(filled_qty) <= 0:
+                logger.warning(f"{symbol} 入场未成交或数量为0，跳过保护单创建。")
+                result = {
+                    'entry_order': order,
+                    'filled_qty': filled_qty or 0,
+                    'entry_price': entry_price,
+                    'sl_order': None,
+                    'tp_order': None,
+                    'tp_sl_attached': False,
+                }
+                return result
+            # 校验交易所持仓是否存在（SWAP）
+            pos_side_flag_check = 'long' if side == 'buy' else 'short'
+            has_real_position = False
+            try:
+                ex_positions = []
+                try:
+                    ex_positions = exchange.fetch_positions(params={'instType': 'SWAP'}) or []
+                except Exception:
+                    ex_positions = exchange.fetch_positions() or []
+                for px in ex_positions:
+                    psym = px.get('symbol')
+                    if psym != symbol:
+                        # 兼容从 info.instId 映射
+                        info = px.get('info') or {}
+                        inst_id = info.get('instId') or info.get('inst_id')
+                        if inst_id and hasattr(exchange, 'markets_by_id'):
+                            m = exchange.markets_by_id.get(inst_id)
+                            psym = m.get('symbol') if m else None
+                    side_ccxt = (px.get('side') or '').lower()
+                    if psym == symbol and ((pos_side_flag_check == 'long' and side_ccxt == 'long') or (pos_side_flag_check == 'short' and side_ccxt == 'short')):
+                        contracts = float(px.get('contracts') or px.get('positionAmt') or px.get('contractsAbs') or 0)
+                        if contracts > 0:
+                            has_real_position = True
+                            break
+            except Exception:
+                has_real_position = False
+            if not has_real_position:
+                logger.warning(f"{symbol} 交易所未发现真实持仓（posSide={pos_side_flag_check}），跳过保护单创建。")
+                result = {
+                    'entry_order': order,
+                    'filled_qty': filled_qty,
+                    'entry_price': entry_price,
+                    'sl_order': None,
+                    'tp_order': None,
+                    'tp_sl_attached': False,
+                }
+                return result
+        except Exception:
+            # 若校验异常，稳妥起见也跳过保护单创建
+            result = {
+                'entry_order': order,
+                'filled_qty': filled_qty,
+                'entry_price': entry_price,
+                'sl_order': None,
+                'tp_order': None,
+                'tp_sl_attached': False,
+            }
+            return result
 
         # Place conditional SL and TP orders - try several param variations known in ccxt/OKX world
         sl_side = 'sell' if side == 'buy' else 'buy'
