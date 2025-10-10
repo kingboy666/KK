@@ -821,87 +821,76 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             }
             return result
 
-        # attempt variation 1: common param names
-        sl_params_try = {
-            'triggerPrice': float(sl_price),
-            'reduceOnly': True,
-            'closeOnTrigger': True,  # if supported
-
-            'tdMode': 'cross',
-            'posSide': pos_side,
-            # optionally: 'triggerType':'last_price'
-        }
-        tp_params_try = {
-            'triggerPrice': float(tp_price),
-            'reduceOnly': True,
-            'closeOnTrigger': True,
-
-            'tdMode': 'cross',
-            'posSide': pos_side,
-        }
-        # try create_order with type='market' and params as conditional
+        # 使用 OKX 原生 OCO 一次性挂 TP/SL，先撤旧再挂，避免重复
         try:
-            sl_order = exchange.create_order(symbol, type='market', side=sl_side, amount=filled_qty, price=None, params=sl_params_try)
-            tp_order = exchange.create_order(symbol, type='market', side=tp_side, amount=filled_qty, price=None, params=tp_params_try)
-            logger.info(f"Placed conditional SL/TP (try1) for {symbol}")
-        except Exception as e1:
-            logger.warning(f"conditional create (try1) failed: {e1}; trying alternative params")
-            # attempt variation 2: different param keys
-            alt_sl_params = {
-                'stopPrice': float(sl_price),
-                'reduceOnly': True,
-                'orderType': 'market',
-                'tdMode': 'cross',
-                'posSide': pos_side,
-
-            }
-            alt_tp_params = {
-                'stopPrice': float(tp_price),
-                'reduceOnly': True,
-                'orderType': 'market',
-                'tdMode': 'cross',
-                'posSide': pos_side,
-
-            }
+            pos_side_flag = 'long' if side == 'buy' else 'short'
+            # 清理历史保护单并短暂休眠防竞态
             try:
-                sl_order = exchange.create_order(symbol, type='market', side=sl_side, amount=filled_qty, price=None, params=alt_sl_params)
-                tp_order = exchange.create_order(symbol, type='market', side=tp_side, amount=filled_qty, price=None, params=alt_tp_params)
-                logger.info(f"Placed conditional SL/TP (try2) for {symbol}")
-            except Exception as e2:
-                logger.warning(f"conditional create (try2) failed: {e2}; trying okx algo endpoint fallback")
-                # Some ccxt versions expose privatePost... endpoints; try raw call (best-effort)
-                try:
-                    # This is a heuristic fallback and may need adjustment per ccxt version
-                    if hasattr(exchange, 'private_post_trade_batch_orders'):
-                        # example payload; requires exact keys for OKX REST; user should validate in sandbox
-                        sl_payload = {
-                            "instId": symbol.replace("/", "-"),
-                            "tdMode": "cross",
-                            "side": sl_side.upper(),
-                            "ordType": "conditional",
-                            "sz": str(filled_qty),
-                            "px": str(sl_price),
-                            "triggerPx": str(sl_price),
-                            "reduceOnly": "true",
-                        }
-                        # raw call - may not exist
-                        resp_sl = exchange.private_post_trade_batch_orders({"orders_data":[sl_payload]})
-                        sl_order = resp_sl
-                    else:
-                        raise Exception("raw fallback not supported in this ccxt build")
-                except Exception as e3:
-                    logger.error(f"All conditional-order attempts failed for {symbol}: {e3}")
-                    sl_order = None
-                    # we will fallback to local-monitoring as protection
+                cancel_all_protection(symbol, pos_side_flag)
+                time.sleep(0.3)
+            except Exception:
+                pass
+            # 组织 OCO 参数（执行价设为 -1 表示市价）
+            inst_id = okx_inst_id(symbol)
+            # 对触发价进行方向性钳制与精度对齐（尽量减少风控错误），采用简单安全回退：仅四舍五入至 1e-4
+            try:
+                price_prec = 4
+                tick = 10 ** (-price_prec)
+                sl_price = math.floor(float(sl_price) / tick) * tick if side == 'buy' else math.ceil(float(sl_price) / tick) * tick
+                tp_price = math.ceil(float(tp_price) / tick) * tick if side == 'buy' else math.floor(float(tp_price) / tick) * tick
+            except Exception:
+                pass
+            payload = {
+                'instId': inst_id,
+                'tdMode': 'cross',
+                'posSide': pos_side_flag,
+                'side': ('sell' if side == 'buy' else 'buy'),
+                'ordType': 'oco',
+                'reduceOnly': True,
+                'sz': str(filled_qty),
+                'tpTriggerPx': str(tp_price),
+                'tpOrdPx': '-1',
+                'slTriggerPx': str(sl_price),
+                'slOrdPx': '-1',
+            }
+            # 兼容 ccxt 原生私有接口命名
+            if hasattr(exchange, 'private_post_trade_order_algo'):
+                resp = exchange.private_post_trade_order_algo(payload)
+            elif hasattr(exchange, 'privatePostTradeOrderAlgo'):
+                resp = exchange.privatePostTradeOrderAlgo(payload)
+            else:
+                resp = None
+            ok = False
+            if isinstance(resp, dict):
+                code = str(resp.get('code', ''))
+                ok = (code == '0' or code == '200' or (resp.get('data') and (code == '' or code == '0')))
+            else:
+                ok = bool(resp)
+            if ok:
+                logger.info(f"{symbol} 使用 OCO 挂交易所侧 TP/SL 成功: sz={filled_qty} TP@{tp_price} SL@{sl_price}")
+                result = {
+                    'entry_order': order,
+                    'filled_qty': filled_qty,
+                    'entry_price': entry_price,
+                    'sl_order': None,
+                    'tp_order': None,
+                    'tp_sl_attached': True,
+                    'tp_sl_updated_at': datetime.now(timezone.utc).isoformat(),
+                }
+                return result
+            else:
+                logger.warning(f"{symbol} OCO 挂单失败，进入本地兜底逻辑: {resp}")
+        except Exception as eoco:
+            logger.warning(f"{symbol} OCO 条件单异常，进入本地兜底: {eoco}")
 
-        # Build return structure
+        # 兜底：未能成功挂交易所侧 TP/SL，则仅返回入场信息，后续由本地监控处理
         result = {
             'entry_order': order,
             'filled_qty': filled_qty,
             'entry_price': entry_price,
-            'sl_order': sl_order,
-            'tp_order': tp_order,
-            'tp_sl_attached': True if (sl_order or tp_order) else False,
+            'sl_order': None,
+            'tp_order': None,
+            'tp_sl_attached': False,
         }
         return result
 
@@ -1277,16 +1266,49 @@ def monitor_and_run():
 
                                 pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
                                 try:
-                                    sl_params_upd = {'triggerPrice': float(desired_sl), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
-                                    tp_params_upd = {'triggerPrice': float(desired_tp), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
-                                    sl_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=sl_params_upd)
-                                    tp_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=tp_params_upd)
-                                    p['sl_order'] = sl_o; p['tp_order'] = tp_o
-                                    if isinstance(sl_o, dict): p['sl_order_id'] = sl_o.get('id') or sl_o.get('algoId') or sl_o.get('order_id')
-                                    if isinstance(tp_o, dict): p['tp_order_id'] = tp_o.get('id') or tp_o.get('algoId') or tp_o.get('order_id')
-                                    p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
-                                    p['tp_sl_updated_at'] = datetime.now(timezone.utc).isoformat()
-                                    logger.info(f"{symbol} dynamically updated exchange-side TP/SL (old canceled).")
+                                    # 使用 OKX 原生 OCO 重新挂 TP/SL
+                                    inst_id = okx_inst_id(symbol)
+                                    # 简单精度对齐
+                                    try:
+                                        price_prec = 4
+                                        tick = 10 ** (-price_prec)
+                                        desired_sl = math.floor(float(desired_sl) / tick) * tick if p['side'] == 'buy' else math.ceil(float(desired_sl) / tick) * tick
+                                        desired_tp = math.ceil(float(desired_tp) / tick) * tick if p['side'] == 'buy' else math.floor(float(desired_tp) / tick) * tick
+                                    except Exception:
+                                        pass
+                                    payload = {
+                                        'instId': inst_id,
+                                        'tdMode': 'cross',
+                                        'posSide': pos_side_flag,
+                                        'side': ('sell' if p['side']=='buy' else 'buy'),
+                                        'ordType': 'oco',
+                                        'reduceOnly': True,
+                                        'sz': str(p['qty']),
+                                        'tpTriggerPx': str(desired_tp),
+                                        'tpOrdPx': '-1',
+                                        'slTriggerPx': str(desired_sl),
+                                        'slOrdPx': '-1',
+                                    }
+                                    if hasattr(exchange, 'private_post_trade_order_algo'):
+                                        resp_upd = exchange.private_post_trade_order_algo(payload)
+                                    elif hasattr(exchange, 'privatePostTradeOrderAlgo'):
+                                        resp_upd = exchange.privatePostTradeOrderAlgo(payload)
+                                    else:
+                                        resp_upd = None
+                                    ok_upd = False
+                                    if isinstance(resp_upd, dict):
+                                        code_u = str(resp_upd.get('code', ''))
+                                        ok_upd = (code_u == '0' or code_u == '200' or (resp_upd.get('data') and (code_u == '' or code_u == '0')))
+                                    else:
+                                        ok_upd = bool(resp_upd)
+                                    if ok_upd:
+                                        p['sl_order'] = None; p['tp_order'] = None
+                                        p['sl_order_id'] = None; p['tp_order_id'] = None
+                                        p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
+                                        p['tp_sl_updated_at'] = datetime.now(timezone.utc).isoformat()
+                                        logger.info(f"{symbol} 使用 OCO 动态更新交易所侧 TP/SL 成功。")
+                                    else:
+                                        logger.warning(f"{symbol} OCO 动态更新失败：{resp_upd}")
                                 except Exception as ex_upd:
                                     logger.warning(f"{symbol} dynamic TP/SL update failed: {ex_upd}")
 
