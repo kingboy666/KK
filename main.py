@@ -281,6 +281,81 @@ def log_summary(free_usdt: float):
 # ----------------------------
 # Account helpers
 # ----------------------------
+def sync_positions_from_exchange():
+    """
+    同步交易所当前SWAP持仓到本地 positions（仅在本地不存在该symbol持仓时建立）。
+    使程序在重启或手动开仓后也能正确显示持仓与继续管理保护单。
+    """
+    try:
+        # 优先使用 ccxt 统一接口
+        ex_positions = []
+        try:
+            ex_positions = exchange.fetch_positions(params={'instType': 'SWAP'}) or []
+        except Exception:
+            # 某些版本不接受该参数，退回无参
+            try:
+                ex_positions = exchange.fetch_positions() or []
+            except Exception:
+                ex_positions = []
+
+        for px in ex_positions:
+            try:
+                sym = px.get('symbol')
+                if not sym:
+                    # 兼容：从 info.instId 转换
+                    info = px.get('info') or {}
+                    inst_id = info.get('instId') or info.get('inst_id')
+                    if inst_id and hasattr(exchange, 'markets_by_id'):
+                        m = exchange.markets_by_id.get(inst_id)
+                        sym = m.get('symbol') if m else None
+                if not sym:
+                    continue
+
+                # 只关心非零合约数
+                contracts = safe_float(px.get('contracts') or px.get('positionAmt') or px.get('contractsAbs') or 0)
+                if contracts <= 0:
+                    continue
+
+                side_ccxt = (px.get('side') or '').lower()  # 'long'/'short'（ccxt标准）
+                pos_side = 'buy' if side_ccxt == 'long' else ('sell' if side_ccxt == 'short' else None)
+                if not pos_side:
+                    continue
+
+                entry_price = safe_float(px.get('entryPrice') or px.get('avgCostPrice') or px.get('markPrice') or 0)
+                # 若本地已有，不覆盖数量与方向（避免干扰当前单管理）
+                if sym in positions:
+                    continue
+
+                # 初始化本地结构（简化，TP/SL价格稍后由动态模块计算与覆盖）
+                positions[sym] = {
+                    'side': pos_side,
+                    'entry_price': entry_price,
+                    'qty': contracts,
+                    'sl_order': None,
+                    'tp_order': None,
+                    'opened_at': datetime.now(timezone.utc).isoformat(),
+                    'atr_sl_value': None,
+                    'atr_val': None,
+                    'sl_price': None,
+                    'tp_price': None,
+                    'tp_sl_attached': False,
+                    'tp_sl_attempted': False,
+                    'tp_sl_updated_at': None,
+                    'highest_since_entry': entry_price if pos_side == 'buy' else None,
+                    'lowest_since_entry': entry_price if pos_side == 'sell' else None,
+                    'trail_last_update_at': None,
+                    'cfg': SYMBOL_CONFIG.get(sym) or (GLOBAL_TIMEFRAME, 20, 2.0, 3.0),
+                }
+                # 尝试标记已存在的保护单
+                try:
+                    mark_existing_protection(sym, positions[sym])
+                except Exception:
+                    pass
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"同步交易所持仓失败：{e}")
+
 def safe_float(v):
     try:
         return float(v)
@@ -882,6 +957,8 @@ def monitor_and_run():
     while True:
         start_ts = time.time()
         try:
+            # 同步交易所当前持仓到本地（解决重启/手动开仓后看板不显示的问题）
+            sync_positions_from_exchange()
             # fetch balance and calculate allocation per symbol (equal allocation of free USDT)
             free_usdt = get_free_balance_usdt()
             if free_usdt <= 0:
