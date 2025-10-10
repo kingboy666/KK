@@ -112,6 +112,13 @@ CONFIRM_CANDLES = int(os.getenv("CONFIRM_CANDLES", "2"))  # require 2 consecutiv
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # fraction of account balance risk per trade
 MIN_ORDER_USDT = float(os.getenv("MIN_ORDER_USDT", "1.0"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.0008"))  # slippage / fees approx
+
+# 下单名义金额配置（优先级：TARGET_NOTIONAL_USDT > 平均分配×ORDER_NOTIONAL_FACTOR，再夹在区间内）
+TARGET_NOTIONAL_USDT = os.getenv("TARGET_NOTIONAL_USDT")
+ORDER_NOTIONAL_FACTOR = float(os.getenv("ORDER_NOTIONAL_FACTOR", "50"))
+MIN_PER_SYMBOL_USDT = float(os.getenv("MIN_PER_SYMBOL_USDT", "0"))
+MAX_PER_SYMBOL_USDT = float(os.getenv("MAX_PER_SYMBOL_USDT", "0"))
+
 SANDBOX = os.getenv("SANDBOX", "false").lower() in ("1", "true", "yes")
 DYNAMIC_TPSL = os.getenv("DYNAMIC_TPSL", "true").lower() in ("1", "true", "yes")
 MIN_TPSL_UPDATE_INTERVAL_SEC = int(os.getenv("MIN_TPSL_UPDATE_INTERVAL_SEC", "60"))
@@ -454,9 +461,11 @@ def fetch_okx_algo_protections(symbol: str, pos_side: str):
     out = []
     try:
         if hasattr(exchange, 'private_get_trade_orders_algo_pending'):
-            inst_id = okx_inst_id(symbol)
-            # 常见 ordType: conditional/oco
-            resp = exchange.private_get_trade_orders_algo_pending({'instType': 'SWAP', 'instId': inst_id})
+            # 放宽：优先全量 SWAP（不带 instId），失败再回退带 instId
+            try:
+                resp = exchange.private_get_trade_orders_algo_pending({'instType': 'SWAP'})
+            except Exception:
+                resp = exchange.private_get_trade_orders_algo_pending({'instType': 'SWAP', 'instId': okx_inst_id(symbol)})
             data = (resp or {}).get('data') or resp or []
             if isinstance(data, list):
                 for it in data:
@@ -1050,8 +1059,19 @@ def monitor_and_run():
                 # If no position and signal exists -> open
                 if (not pos) and signal in ('buy','sell'):
                     side = 'buy' if signal == 'buy' else 'sell'
-                    # determine entry notional: use alloc_per_symbol
-                    notional = alloc_per_symbol
+                    # 计算名义下单金额（USDT）
+                    # 优先使用 TARGET_NOTIONAL_USDT；否则 平均分配×ORDER_NOTIONAL_FACTOR，并夹在 [MIN_PER_SYMBOL_USDT, MAX_PER_SYMBOL_USDT] 区间
+                    if TARGET_NOTIONAL_USDT and str(TARGET_NOTIONAL_USDT).strip():
+                        try:
+                            notional = float(TARGET_NOTIONAL_USDT)
+                        except Exception:
+                            notional = alloc_per_symbol
+                    else:
+                        notional = alloc_per_symbol * max(1.0, ORDER_NOTIONAL_FACTOR)
+                        if MIN_PER_SYMBOL_USDT > 0:
+                            notional = max(notional, MIN_PER_SYMBOL_USDT)
+                        if MAX_PER_SYMBOL_USDT > 0:
+                            notional = min(notional, MAX_PER_SYMBOL_USDT)
                     # determine entry price estimate
                     ticker = exchange.fetch_ticker(symbol)
                     entry_price_est = ticker.get('last') if ticker and 'last' in ticker else df['close'].iloc[-1]
@@ -1202,6 +1222,7 @@ def monitor_and_run():
                                 try:
                                     pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
                                     cancel_all_protection(symbol, pos_side_flag)
+                                    time.sleep(0.3)
                                 except Exception:
                                     pass
                                 # cancel previous protective orders if we have ids; 若无id，则从交易所侧筛选并取消
