@@ -56,6 +56,7 @@ MIN_ORDER_USDT = float(os.getenv("MIN_ORDER_USDT", "1.0"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.0008"))  # slippage / fees approx
 SANDBOX = os.getenv("SANDBOX", "false").lower() in ("1", "true", "yes")
 DYNAMIC_TPSL = os.getenv("DYNAMIC_TPSL", "true").lower() in ("1", "true", "yes")
+MIN_TPSL_UPDATE_INTERVAL_SEC = int(os.getenv("MIN_TPSL_UPDATE_INTERVAL_SEC", "60"))
 
 # Fetch / timing
 BARS_LIMIT = 200
@@ -189,6 +190,53 @@ def get_free_balance_usdt():
             time.sleep(1 + attempts)
     logger.error("Unable to reliably fetch balance")
     return 0.0
+
+# ----------------------------
+# Exchange-side protection helpers (detect and reconcile once)
+# ----------------------------
+def fetch_open_reduce_only(symbol, pos_side):
+    """
+    Return list of open reduceOnly protective orders for symbol and pos_side (long/short).
+    """
+    try:
+        open_orders = exchange.fetch_open_orders(symbol, params={'tdMode': 'cross'})
+        result = []
+        for o in (open_orders or []):
+            try:
+                params = o.get('info') or {}
+                ro = o.get('reduceOnly') if o.get('reduceOnly') is not None else str(params.get('reduceOnly', '')).lower() in ('true','1')
+                ps = params.get('posSide') or params.get('positionSide') or ''
+                if ro and str(ps).lower() == str(pos_side).lower():
+                    result.append(o)
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        logger.debug(f"{symbol} fetch_open_reduce_only error: {e}")
+        return []
+
+def mark_existing_protection(symbol, p):
+    """
+    If exchange already has reduceOnly protective orders for this position, mark attached and set ids.
+    Returns True if found any.
+    """
+    pos_side_flag = 'long' if p.get('side') == 'buy' else 'short'
+    existing = fetch_open_reduce_only(symbol, pos_side_flag)
+    if existing:
+        # Try to map ids
+        for o in existing:
+            oid = o.get('id') or (o.get('info') or {}).get('algoId') or (o.get('info') or {}).get('order_id')
+            if not oid:
+                continue
+            # 先尽力放到本地结构里，无法区分SL/TP也问题不大，标记为已附加即可
+            if not p.get('sl_order_id'):
+                p['sl_order_id'] = oid
+            elif not p.get('tp_order_id'):
+                p['tp_order_id'] = oid
+        p['tp_sl_attached'] = True
+        p['tp_sl_attempted'] = True
+        return True
+    return False
 
 # ----------------------------
 # Qty calculation respecting OKX contract size and limits
@@ -645,6 +693,15 @@ def monitor_and_run():
                 if positions.get(symbol):
                     # attach/update exchange-side TP/SL exactly-once; avoid duplicates; dynamic update cancels previous first
                     p = positions[symbol]
+
+                    # Detect if exchange already has reduceOnly protection; if yes, mark and skip attach
+                    if not p.get('tp_sl_attached'):
+                        try:
+                            if mark_existing_protection(symbol, p):
+                                logger.info(f"{symbol} detected existing exchange TP/SL; skip re-attach.")
+                        except Exception as e:
+                            logger.debug(f"{symbol} protection detection error: {e}")
+
                     try:
                         # compute desired SL/TP based on latest ATR but original entry price and per-symbol config
                         atr_latest = compute_atr(df, ATR_PERIOD).iloc[-1]
@@ -671,16 +728,50 @@ def monitor_and_run():
 
                         # 2) Dynamic update: if enabled and prices changed materially, cancel old and re-place new
                         elif DYNAMIC_TPSL and p.get('tp_sl_attached'):
-                            eps = max(1e-8, abs(p.get('sl_price', desired_sl)) * 0.0005)
+                            # throttle updates to avoid flapping
+                            try:
+                                last_upd_iso = p.get('tp_sl_updated_at') or p.get('opened_at')
+                                last_upd_dt = None
+                                if last_upd_iso:
+                                    try:
+                                        # best-effort parse ISO; timezone-aware preferred
+                                        last_upd_dt = datetime.fromisoformat(last_upd_iso.replace('Z','+00:00'))
+                                    except Exception:
+                                        last_upd_dt = None
+                                now_dt = datetime.now(datetime.UTC)
+                                allow_update = True
+                                if last_upd_dt:
+                                    allow_update = (now_dt - last_upd_dt).total_seconds() >= MIN_TPSL_UPDATE_INTERVAL_SEC
+                            except Exception:
+                                allow_update = True
+
+                            eps = max(1e-8, abs(p.get('sl_price', desired_sl)) * 0.001)  # 放宽阈值，避免微小波动频繁更新
                             changed = (abs(desired_sl - p.get('sl_price', desired_sl)) > eps) or (abs(desired_tp - p.get('tp_price', desired_tp)) > eps)
-                            if changed:
-                                # cancel previous protective orders if we have ids
-                                for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
+
+                            if allow_update and changed:
+                                # cancel previous protective orders if we have ids; 若无id，则从交易所侧筛选并取消
+                                canceled_any = False
+                                ids = [p.get('sl_order_id'), p.get('tp_order_id')]
+                                for oid in ids:
                                     if oid:
                                         try:
                                             exchange.cancel_order(oid, symbol, params={})
+                                            canceled_any = True
                                         except Exception:
                                             pass
+                                if not canceled_any:
+                                    try:
+                                        pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
+                                        for o in fetch_open_reduce_only(symbol, pos_side_flag):
+                                            oid = o.get('id') or (o.get('info') or {}).get('algoId') or (o.get('info') or {}).get('order_id')
+                                            if oid:
+                                                try:
+                                                    exchange.cancel_order(oid, symbol, params={})
+                                                except Exception:
+                                                    pass
+                                    except Exception:
+                                        pass
+
                                 pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
                                 try:
                                     sl_params_upd = {'triggerPrice': float(desired_sl), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
@@ -691,6 +782,7 @@ def monitor_and_run():
                                     if isinstance(sl_o, dict): p['sl_order_id'] = sl_o.get('id') or sl_o.get('algoId') or sl_o.get('order_id')
                                     if isinstance(tp_o, dict): p['tp_order_id'] = tp_o.get('id') or tp_o.get('algoId') or tp_o.get('order_id')
                                     p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
+                                    p['tp_sl_updated_at'] = datetime.now(datetime.UTC).isoformat()
                                     logger.info(f"{symbol} dynamically updated exchange-side TP/SL (old canceled).")
                                 except Exception as ex_upd:
                                     logger.warning(f"{symbol} dynamic TP/SL update failed: {ex_upd}")
