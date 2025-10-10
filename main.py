@@ -456,14 +456,32 @@ def fetch_open_reduce_only(symbol, pos_side):
         return []
 
 def okx_inst_id(symbol: str) -> str:
-    # OKX 合约 instId 形如 BTC-USDT-SWAP
+    """
+    生成 OKX 原生 instId：
+    - 优先使用 ccxt 的 market(symbol)['id']（如 BTC-USDT-SWAP）
+    - 回退：将 "/" 换为 "-"，去掉 ":" 及其后缀（如 ":USDT"），最后确保以 "-SWAP" 结尾
+    """
     try:
-        s = symbol.replace("/", "-")
+        # 优先从市场元数据获取
+        try:
+            mkt = exchange.market(symbol)
+            if isinstance(mkt, dict):
+                inst = mkt.get('id') or mkt.get('symbol')
+                if inst and '-' in inst:
+                    return inst
+        except Exception:
+            pass
+        # 安全回退构造
+        s = str(symbol).replace("/", "-")
+        # 去掉例如 ":USDT" 的后缀
+        if ":" in s:
+            s = s.split(":", 1)[0]
+        # 确保是 SWAP 合约后缀
         if not s.endswith("-SWAP"):
             s = f"{s}-SWAP"
         return s
     except Exception:
-        return symbol
+        return str(symbol)
 
 def fetch_okx_algo_protections(symbol: str, pos_side: str):
     """
