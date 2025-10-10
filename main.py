@@ -8,7 +8,7 @@ import time
 import math
 import logging
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import ccxt
 import pandas as pd
@@ -57,6 +57,10 @@ SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.0008"))  # slippage / fees app
 SANDBOX = os.getenv("SANDBOX", "false").lower() in ("1", "true", "yes")
 DYNAMIC_TPSL = os.getenv("DYNAMIC_TPSL", "true").lower() in ("1", "true", "yes")
 MIN_TPSL_UPDATE_INTERVAL_SEC = int(os.getenv("MIN_TPSL_UPDATE_INTERVAL_SEC", "60"))
+# Comma-separated symbols to disable dynamic TP/SL (e.g. "WLD/USDT:USDT,BTC/USDT:USDT")
+DYNAMIC_TPSL_DISABLED = set(s.strip() for s in os.getenv("DYNAMIC_TPSL_DISABLED", "").split(",") if s.strip())
+def is_dynamic_enabled(symbol: str) -> bool:
+    return DYNAMIC_TPSL and (symbol not in DYNAMIC_TPSL_DISABLED)
 
 # Fetch / timing
 BARS_LIMIT = 200
@@ -196,7 +200,8 @@ def get_free_balance_usdt():
 # ----------------------------
 def fetch_open_reduce_only(symbol, pos_side):
     """
-    Return list of open reduceOnly protective orders for symbol and pos_side (long/short).
+    Return list of exchange-side protective orders for symbol+posSide.
+    Some OKX algo TP/SL may not expose reduceOnly; detect via info.algoId/ordType as well.
     """
     try:
         open_orders = exchange.fetch_open_orders(symbol, params={'tdMode': 'cross'})
@@ -204,9 +209,15 @@ def fetch_open_reduce_only(symbol, pos_side):
         for o in (open_orders or []):
             try:
                 params = o.get('info') or {}
-                ro = o.get('reduceOnly') if o.get('reduceOnly') is not None else str(params.get('reduceOnly', '')).lower() in ('true','1')
-                ps = params.get('posSide') or params.get('positionSide') or ''
-                if ro and str(ps).lower() == str(pos_side).lower():
+                # detect reduceOnly or algo-like orders
+                ro = o.get('reduceOnly')
+                if ro is None:
+                    ro = str(params.get('reduceOnly', '')).lower() in ('true','1')
+                ord_type = (o.get('type') or params.get('ordType') or params.get('orderType') or '').lower()
+                has_algo = bool(params.get('algoId') or params.get('algoClOrdId'))
+                ps = (params.get('posSide') or params.get('positionSide') or '').lower()
+                # treat as protection if reduceOnly or algo order, and posSide matches
+                if (ro or has_algo or ord_type in ('conditional','trigger','oco','stop','take_profit','tp','sl')) and ps == str(pos_side).lower():
                     result.append(o)
             except Exception:
                 continue
@@ -222,6 +233,7 @@ def mark_existing_protection(symbol, p):
     """
     pos_side_flag = 'long' if p.get('side') == 'buy' else 'short'
     existing = fetch_open_reduce_only(symbol, pos_side_flag)
+    logger.info(f"{symbol} posSide={pos_side_flag} open protection orders detected: {len(existing)}")
     if existing:
         # Try to map ids
         for o in existing:
@@ -674,7 +686,7 @@ def monitor_and_run():
                             'qty': filled_qty,
                             'sl_order': sl_order,
                             'tp_order': tp_order,
-                            'opened_at': datetime.now(datetime.UTC).isoformat(),
+                            'opened_at': datetime.now(timezone.utc).isoformat(),
                             'atr_sl_value': current_atr * atr_mult_sl,
                             'atr_val': current_atr,
                             'sl_price': sl_price,
@@ -699,6 +711,8 @@ def monitor_and_run():
                         try:
                             if mark_existing_protection(symbol, p):
                                 logger.info(f"{symbol} detected existing exchange TP/SL; skip re-attach.")
+                            else:
+                                logger.info(f"{symbol} no existing exchange TP/SL detected; will consider first attach if not attempted.")
                         except Exception as e:
                             logger.debug(f"{symbol} protection detection error: {e}")
 
@@ -711,6 +725,7 @@ def monitor_and_run():
                         if (not p.get('tp_sl_attached')) and (not p.get('tp_sl_attempted')):
                             pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
                             try:
+                                logger.info(f"{symbol} first attach TP/SL planned: posSide={pos_side_flag}, qty={p['qty']}, SL={desired_sl}, TP={desired_tp}")
                                 sl_params_once = {'triggerPrice': float(desired_sl), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
                                 tp_params_once = {'triggerPrice': float(desired_tp), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
                                 sl_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=sl_params_once)
@@ -720,14 +735,14 @@ def monitor_and_run():
                                 if isinstance(tp_o, dict): p['tp_order_id'] = tp_o.get('id') or tp_o.get('algoId') or tp_o.get('order_id')
                                 p['tp_sl_attached'] = True
                                 p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
-                                logger.info(f"{symbol} attached exchange-side TP/SL after entry (once).")
+                                logger.info(f"{symbol} attached exchange-side TP/SL after entry (once). sl_id={p.get('sl_order_id')} tp_id={p.get('tp_order_id')}")
                             except Exception as ex_attach_once:
                                 logger.warning(f"{symbol} attach TP/SL after entry failed: {ex_attach_once}")
                             finally:
                                 p['tp_sl_attempted'] = True
 
                         # 2) Dynamic update: if enabled and prices changed materially, cancel old and re-place new
-                        elif DYNAMIC_TPSL and p.get('tp_sl_attached'):
+                        elif is_dynamic_enabled(symbol) and p.get('tp_sl_attached'):
                             # throttle updates to avoid flapping
                             try:
                                 last_upd_iso = p.get('tp_sl_updated_at') or p.get('opened_at')
@@ -740,13 +755,17 @@ def monitor_and_run():
                                         last_upd_dt = None
                                 now_dt = datetime.now(datetime.UTC)
                                 allow_update = True
+                                gap_sec = None
                                 if last_upd_dt:
-                                    allow_update = (now_dt - last_upd_dt).total_seconds() >= MIN_TPSL_UPDATE_INTERVAL_SEC
+                                    gap_sec = (now_dt - last_upd_dt).total_seconds()
+                                    allow_update = gap_sec >= MIN_TPSL_UPDATE_INTERVAL_SEC
                             except Exception:
                                 allow_update = True
+                                gap_sec = None
 
                             eps = max(1e-8, abs(p.get('sl_price', desired_sl)) * 0.001)  # 放宽阈值，避免微小波动频繁更新
                             changed = (abs(desired_sl - p.get('sl_price', desired_sl)) > eps) or (abs(desired_tp - p.get('tp_price', desired_tp)) > eps)
+                            logger.info(f"{symbol} dynamic check: enabled, changed={changed}, allow_update={allow_update}, gap_sec={gap_sec}, eps={eps}, old(SL/TP)=({p.get('sl_price')}/{p.get('tp_price')}), new=({desired_sl}/{desired_tp})")
 
                             if allow_update and changed:
                                 # cancel previous protective orders if we have ids; 若无id，则从交易所侧筛选并取消
@@ -787,6 +806,9 @@ def monitor_and_run():
                                 except Exception as ex_upd:
                                     logger.warning(f"{symbol} dynamic TP/SL update failed: {ex_upd}")
 
+                        else:
+                            if not is_dynamic_enabled(symbol) and p.get('tp_sl_attached'):
+                                logger.info(f"{symbol} dynamic TP/SL disabled by config; skipping update.")
                         # continue with local fallback checks below
                         ticker_now = exchange.fetch_ticker(symbol)
                         last_px = ticker_now.get('last') if ticker_now and 'last' in ticker_now else None
