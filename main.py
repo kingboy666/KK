@@ -21,7 +21,15 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logger = logging.getLogger("railway_kmomentum")
 logger.setLevel(LOG_LEVEL)
 handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+class BeijingFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        from datetime import datetime, timezone, timedelta
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone(timezone(timedelta(hours=8)))
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(timespec='seconds')
+
+handler.setFormatter(BeijingFormatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
 # 中文日志过滤器（按需将常见英文片段替换为中文）
@@ -126,6 +134,10 @@ MIN_TPSL_UPDATE_INTERVAL_SEC = int(os.getenv("MIN_TPSL_UPDATE_INTERVAL_SEC", "60
 TRAIL_SL = os.getenv("TRAIL_SL", "true").lower() in ("1","true","yes")
 TRAIL_MULT = float(os.getenv("TRAIL_MULT", "2.0"))  # 跟踪距离 = ATR * TRAIL_MULT
 TRAIL_UPDATE_INTERVAL_SEC = int(os.getenv("TRAIL_UPDATE_INTERVAL_SEC", "60"))
+# 计划委托冷却（秒）
+PROTECTION_COOLDOWN_SEC = int(os.getenv("PROTECTION_COOLDOWN_SEC", "120"))
+# 记录每个 (symbol, posSide) 最近一次挂保护单时间戳（UTC）
+protection_cooldown_map = {}
 # 按交易对禁用动态更新（逗号分隔）
 DYNAMIC_TPSL_DISABLED = set(s.strip() for s in os.getenv("DYNAMIC_TPSL_DISABLED", "").split(",") if s.strip())
 def is_dynamic_enabled(symbol: str) -> bool:
@@ -1223,6 +1235,21 @@ def monitor_and_run():
                                     pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
                                     cancel_all_protection(symbol, pos_side_flag)
                                     time.sleep(0.3)
+                                except Exception:
+                                    pass
+                                # 冷却检查：避免频繁创建计划委托
+                                try:
+                                    from datetime import datetime, timezone
+                                    now_dt = datetime.now(timezone.utc)
+                                    key = (symbol, pos_side_flag)
+                                    last = protection_cooldown_map.get(key)
+                                    if last:
+                                        gap = (now_dt - last).total_seconds()
+                                        if gap < PROTECTION_COOLDOWN_SEC:
+                                            logger.info(f"{symbol} 保护单冷却中（剩余{int(PROTECTION_COOLDOWN_SEC-gap)}秒），本次跳过动态更新。")
+                                            continue
+                                    # 记录冷却起点
+                                    protection_cooldown_map[key] = now_dt
                                 except Exception:
                                     pass
                                 # cancel previous protective orders if we have ids; 若无id，则从交易所侧筛选并取消
