@@ -57,7 +57,11 @@ SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.0008"))  # slippage / fees app
 SANDBOX = os.getenv("SANDBOX", "false").lower() in ("1", "true", "yes")
 DYNAMIC_TPSL = os.getenv("DYNAMIC_TPSL", "true").lower() in ("1", "true", "yes")
 MIN_TPSL_UPDATE_INTERVAL_SEC = int(os.getenv("MIN_TPSL_UPDATE_INTERVAL_SEC", "60"))
-# Comma-separated symbols to disable dynamic TP/SL (e.g. "WLD/USDT:USDT,BTC/USDT:USDT")
+# 跟踪止损配置
+TRAIL_SL = os.getenv("TRAIL_SL", "true").lower() in ("1","true","yes")
+TRAIL_MULT = float(os.getenv("TRAIL_MULT", "2.0"))  # 跟踪距离 = ATR * TRAIL_MULT
+TRAIL_UPDATE_INTERVAL_SEC = int(os.getenv("TRAIL_UPDATE_INTERVAL_SEC", "60"))
+# 按交易对禁用动态更新（逗号分隔）
 DYNAMIC_TPSL_DISABLED = set(s.strip() for s in os.getenv("DYNAMIC_TPSL_DISABLED", "").split(",") if s.strip())
 def is_dynamic_enabled(symbol: str) -> bool:
     return DYNAMIC_TPSL and (symbol not in DYNAMIC_TPSL_DISABLED)
@@ -693,6 +697,10 @@ def monitor_and_run():
                             'tp_price': tp_price,
                             'tp_sl_attached': bool(res.get('tp_sl_attached', False)),
                             'tp_sl_attempted': bool(res.get('tp_sl_attached', False)),
+                            # 跟踪止损锚点
+                            'highest_since_entry': entry_price if side == 'buy' else None,
+                            'lowest_since_entry': entry_price if side == 'sell' else None,
+                            'trail_last_update_at': None,
                             'cfg': cfg
                         }
                         logger.info(f"{symbol} position opened and protective orders placed.")
@@ -720,6 +728,35 @@ def monitor_and_run():
                         # compute desired SL/TP based on latest ATR but original entry price and per-symbol config
                         atr_latest = compute_atr(df, ATR_PERIOD).iloc[-1]
                         desired_sl, desired_tp, _, _ = calc_sl_tp(p['entry_price'], p['side'], atr_latest, p['cfg'][2], p['cfg'][3])
+
+                        # Trailing Stop: 只收紧、不放松
+                        if TRAIL_SL:
+                            # 获取最新价格，更新峰值/谷值
+                            try:
+                                tnow = exchange.fetch_ticker(symbol)
+                                last_px_ts = tnow.get('last') if tnow and 'last' in tnow else None
+                            except Exception:
+                                last_px_ts = None
+                            if last_px_ts:
+                                if p.get('side') == 'buy':
+                                    prev_high = p.get('highest_since_entry') or p['entry_price']
+                                    if last_px_ts > prev_high:
+                                        p['highest_since_entry'] = last_px_ts
+                                elif p.get('side') == 'sell':
+                                    prev_low = p.get('lowest_since_entry') or p['entry_price']
+                                    if last_px_ts < prev_low:
+                                        p['lowest_since_entry'] = last_px_ts
+
+                            # 以 ATR*TRAIL_MULT 作为跟踪距离
+                            trail_dist = float(atr_latest) * float(TRAIL_MULT)
+                            if p.get('side') == 'buy' and p.get('highest_since_entry'):
+                                trail_sl = float(p['highest_since_entry']) - trail_dist
+                                # 只上移，不下移
+                                desired_sl = max(desired_sl, trail_sl)
+                            elif p.get('side') == 'sell' and p.get('lowest_since_entry'):
+                                trail_sl = float(p['lowest_since_entry']) + trail_dist
+                                # 只下移，不上移
+                                desired_sl = min(desired_sl, trail_sl)
 
                         # 1) Attach once if not yet attached and not attempted
                         if (not p.get('tp_sl_attached')) and (not p.get('tp_sl_attempted')):
@@ -753,12 +790,14 @@ def monitor_and_run():
                                         last_upd_dt = datetime.fromisoformat(last_upd_iso.replace('Z','+00:00'))
                                     except Exception:
                                         last_upd_dt = None
-                                now_dt = datetime.now(datetime.UTC)
+                                now_dt = datetime.now(timezone.utc)
                                 allow_update = True
                                 gap_sec = None
                                 if last_upd_dt:
                                     gap_sec = (now_dt - last_upd_dt).total_seconds()
-                                    allow_update = gap_sec >= MIN_TPSL_UPDATE_INTERVAL_SEC
+                                    # 动态更新与跟踪止损的节流：取更严格的间隔
+                                    min_gap = max(MIN_TPSL_UPDATE_INTERVAL_SEC, TRAIL_UPDATE_INTERVAL_SEC)
+                                    allow_update = gap_sec >= min_gap
                             except Exception:
                                 allow_update = True
                                 gap_sec = None
