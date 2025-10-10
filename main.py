@@ -83,6 +83,8 @@ if SANDBOX:
 exchange = ccxt.okx(exchange_opts)
 exchange.verbose = False
 
+
+
 # ----------------------------
 # Helpers: indicators & data fetch
 # ----------------------------
@@ -214,11 +216,12 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             qty = max(1.0, (notional_usdt * leverage))  # best-effort fallback
 
         # Place market order
+        pos_side = 'long' if side == 'buy' else 'short'
         try:
-            order = exchange.create_market_order(symbol, side, qty)
+            order = exchange.create_market_order(symbol, side, qty, params={'tdMode': 'cross', 'posSide': pos_side})
         except Exception as e:
             logger.warning(f"market order creation raised: {e}; trying create_order('market') fallback")
-            order = exchange.create_order(symbol, 'market', side, qty, None)
+            order = exchange.create_order(symbol, 'market', side, qty, None, params={'tdMode': 'cross', 'posSide': pos_side})
 
         # Determine filled qty and avg price
         filled_qty = None
@@ -250,6 +253,8 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             'reduceOnly': True,
             'closeOnTrigger': True,  # if supported
             'clientOrderId': client_base + "_sl",
+            'tdMode': 'cross',
+            'posSide': pos_side,
             # optionally: 'triggerType':'last_price'
         }
         tp_params_try = {
@@ -257,6 +262,8 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             'reduceOnly': True,
             'closeOnTrigger': True,
             'clientOrderId': client_base + "_tp",
+            'tdMode': 'cross',
+            'posSide': pos_side,
         }
         # try create_order with type='market' and params as conditional
         try:
@@ -270,12 +277,16 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
                 'stopPrice': float(sl_price),
                 'reduceOnly': True,
                 'orderType': 'market',
+                'tdMode': 'cross',
+                'posSide': pos_side,
                 'clientOrderId': client_base + "_sl_v2",
             }
             alt_tp_params = {
                 'stopPrice': float(tp_price),
                 'reduceOnly': True,
                 'orderType': 'market',
+                'tdMode': 'cross',
+                'posSide': pos_side,
                 'clientOrderId': client_base + "_tp_v2",
             }
             try:
@@ -430,7 +441,7 @@ def monitor_and_run():
                             # market close (reduceOnly)
                             qty = pos.get('qty')
                             if qty and float(qty) > 0:
-                                exchange.create_market_order(symbol, 'sell', qty, params={'reduceOnly': True})
+                                exchange.create_market_order(symbol, 'sell', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'long'})
                             # cancel conditional orders if any
                             if pos.get('sl_order_id'):
                                 try:
@@ -451,7 +462,7 @@ def monitor_and_run():
                         try:
                             qty = pos.get('qty')
                             if qty and float(qty) > 0:
-                                exchange.create_market_order(symbol, 'buy', qty, params={'reduceOnly': True})
+                                exchange.create_market_order(symbol, 'buy', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'short'})
                             if pos.get('sl_order_id'):
                                 try:
                                     exchange.cancel_order(pos['sl_order_id'], symbol, params={})
