@@ -1014,7 +1014,7 @@ def monitor_and_run():
                                 close_px = tkc.get('last') if tkc and 'last' in tkc else pos.get('entry_price')
                             except Exception:
                                 close_px = pos.get('entry_price')
-                            update_stats_on_close(symbol, pos, close_px, "反向信号（多→空）")
+                            update_stats_on_close(symbol, pos, float(close_px or 0.0), "反向信号（多→空）")
                             # cancel conditional orders if any
                             if pos.get('sl_order_id'):
                                 try:
@@ -1041,7 +1041,7 @@ def monitor_and_run():
                                 close_px = tkc.get('last') if tkc and 'last' in tkc else pos.get('entry_price')
                             except Exception:
                                 close_px = pos.get('entry_price')
-                            update_stats_on_close(symbol, pos, close_px, "反向信号（空→多）")
+                            update_stats_on_close(symbol, pos, float(close_px or 0.0), "反向信号（空→多）")
                             if pos.get('sl_order_id'):
                                 try:
                                     exchange.cancel_order(pos['sl_order_id'], symbol, params={})
@@ -1228,7 +1228,7 @@ def monitor_and_run():
                                     pass
                                 # 冷却检查：避免频繁创建计划委托
                                 try:
-                                    from datetime import datetime, timezone
+
                                     now_dt = datetime.now(timezone.utc)
                                     key = (symbol, pos_side_flag)
                                     last = protection_cooldown_map.get(key)
@@ -1418,7 +1418,7 @@ def monitor_and_run():
                                     close_px = tkf.get('last') if tkf and 'last' in tkf else p.get('entry_price')
                                 except Exception:
                                     close_px = p.get('entry_price')
-                                update_stats_on_close(symbol, p, close_px, f"保护单触发（{key}）")
+                                update_stats_on_close(symbol, p, float(close_px or 0.0), f"保护单触发（{key}）")
                                 # cancel counterpart if exists
                                 other = 'tp_order_id' if key == 'sl_order_id' else 'sl_order_id'
                                 other_id = p.get(other)
