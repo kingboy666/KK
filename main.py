@@ -252,7 +252,7 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             'triggerPrice': float(sl_price),
             'reduceOnly': True,
             'closeOnTrigger': True,  # if supported
-            'clientOrderId': client_base + "_sl",
+
             'tdMode': 'cross',
             'posSide': pos_side,
             # optionally: 'triggerType':'last_price'
@@ -261,7 +261,7 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             'triggerPrice': float(tp_price),
             'reduceOnly': True,
             'closeOnTrigger': True,
-            'clientOrderId': client_base + "_tp",
+
             'tdMode': 'cross',
             'posSide': pos_side,
         }
@@ -279,7 +279,7 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
                 'orderType': 'market',
                 'tdMode': 'cross',
                 'posSide': pos_side,
-                'clientOrderId': client_base + "_sl_v2",
+
             }
             alt_tp_params = {
                 'stopPrice': float(tp_price),
@@ -287,7 +287,7 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
                 'orderType': 'market',
                 'tdMode': 'cross',
                 'posSide': pos_side,
-                'clientOrderId': client_base + "_tp_v2",
+
             }
             try:
                 sl_order = exchange.create_order(symbol, type='market', side=sl_side, amount=filled_qty, price=None, params=alt_sl_params)
@@ -505,6 +505,8 @@ def monitor_and_run():
                             'opened_at': datetime.utcnow().isoformat(),
                             'atr_sl_value': current_atr * atr_mult_sl,
                             'atr_val': current_atr,
+                            'sl_price': sl_price,
+                            'tp_price': tp_price,
                             'cfg': cfg
                         }
                         logger.info(f"{symbol} position opened and protective orders placed.")
@@ -515,6 +517,82 @@ def monitor_and_run():
 
                 # Optionally: monitor existing conditional orders status, if they triggered -> cleanup
                 if positions.get(symbol):
+                    # local SL/TP fallback protection: if exchange conditional orders not working, enforce locally
+                    try:
+                        p = positions[symbol]
+                        ticker_now = exchange.fetch_ticker(symbol)
+                        last_px = ticker_now.get('last') if ticker_now and 'last' in ticker_now else None
+                        if last_px is None:
+                            last_px = df['close'].iloc[-1]
+                        if last_px:
+                            if p.get('side') == 'buy':
+                                # long: hit SL if last <= sl_price; hit TP if last >= tp_price
+                                if p.get('sl_price') and last_px <= float(p['sl_price']):
+                                    logger.info(f"{symbol} local SL hit for long @ {last_px} <= {p['sl_price']} -> closing position")
+                                    qty = p.get('qty')
+                                    if qty and float(qty) > 0:
+                                        try:
+                                            exchange.create_market_order(symbol, 'sell', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'long'})
+                                        except Exception as e:
+                                            logger.error(f"{symbol} local SL close error: {e}")
+                                    # best-effort cancel protective orders
+                                    for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
+                                        if oid:
+                                            try:
+                                                exchange.cancel_order(oid, symbol, params={})
+                                            except Exception:
+                                                pass
+                                    positions.pop(symbol, None)
+                                elif p.get('tp_price') and last_px >= float(p['tp_price']):
+                                    logger.info(f"{symbol} local TP hit for long @ {last_px} >= {p['tp_price']} -> closing position")
+                                    qty = p.get('qty')
+                                    if qty and float(qty) > 0:
+                                        try:
+                                            exchange.create_market_order(symbol, 'sell', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'long'})
+                                        except Exception as e:
+                                            logger.error(f"{symbol} local TP close error: {e}")
+                                    for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
+                                        if oid:
+                                            try:
+                                                exchange.cancel_order(oid, symbol, params={})
+                                            except Exception:
+                                                pass
+                                    positions.pop(symbol, None)
+                            elif p.get('side') == 'sell':
+                                # short: hit SL if last >= sl_price; hit TP if last <= tp_price
+                                if p.get('sl_price') and last_px >= float(p['sl_price']):
+                                    logger.info(f"{symbol} local SL hit for short @ {last_px} >= {p['sl_price']} -> closing position")
+                                    qty = p.get('qty')
+                                    if qty and float(qty) > 0:
+                                        try:
+                                            exchange.create_market_order(symbol, 'buy', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'short'})
+                                        except Exception as e:
+                                            logger.error(f"{symbol} local SL close error: {e}")
+                                    for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
+                                        if oid:
+                                            try:
+                                                exchange.cancel_order(oid, symbol, params={})
+                                            except Exception:
+                                                pass
+                                    positions.pop(symbol, None)
+                                elif p.get('tp_price') and last_px <= float(p['tp_price']):
+                                    logger.info(f"{symbol} local TP hit for short @ {last_px} <= {p['tp_price']} -> closing position")
+                                    qty = p.get('qty')
+                                    if qty and float(qty) > 0:
+                                        try:
+                                            exchange.create_market_order(symbol, 'buy', qty, params={'reduceOnly': True, 'tdMode': 'cross', 'posSide': 'short'})
+                                        except Exception as e:
+                                            logger.error(f"{symbol} local TP close error: {e}")
+                                    for oid in (p.get('sl_order_id'), p.get('tp_order_id')):
+                                        if oid:
+                                            try:
+                                                exchange.cancel_order(oid, symbol, params={})
+                                            except Exception:
+                                                pass
+                                    positions.pop(symbol, None)
+                    except Exception as e:
+                        logger.warning(f"{symbol} local SL/TP fallback check error: {e}")
+
                     # try to reconcile sl/tp orders; many ccxt implementations return dicts for created orders
                     p = positions[symbol]
                     # if exchange returned order objects with 'id' store them under sl_order_id/tp_order_id
