@@ -361,6 +361,71 @@ def fetch_open_reduce_only(symbol, pos_side):
         logger.debug(f"{symbol} fetch_open_reduce_only error: {e}")
         return []
 
+def cancel_all_protection(symbol, pos_side):
+    """
+    撤掉同 symbol + posSide 的所有保护单（reduceOnly 或 OKX 条件单），返回撤单数量。
+    """
+    try:
+        orders = fetch_open_reduce_only(symbol, pos_side) or []
+        canceled = 0
+        for o in orders:
+            try:
+                oid = o.get('id') or (o.get('info') or {}).get('algoId') or (o.get('info') or {}).get('order_id')
+                if oid:
+                    try:
+                        exchange.cancel_order(oid, symbol, params={})
+                        canceled += 1
+                    except Exception:
+                        # 某些条件单 id 可能不可直接取消，忽略单条失败
+                        pass
+            except Exception:
+                continue
+        if canceled > 0:
+            logger.info(f"{symbol} posSide={pos_side} 已清理保护单数量={canceled}")
+        return canceled
+    except Exception as e:
+        logger.debug(f"{symbol} cancel_all_protection error: {e}")
+        return 0
+
+def enforce_protection_limit(symbol, pos_side, keep=2):
+    """
+    强制限制保护单数量，默认最多保留 keep 个（通常 SL+TP=2）。返回撤销数量。
+    策略：按时间从旧到新排序，保留最新的 keep 个，撤掉其余。
+    """
+    try:
+        orders = fetch_open_reduce_only(symbol, pos_side) or []
+        if len(orders) <= keep:
+            return 0
+        def ord_ts(o):
+            # 优先使用标准 timestamp，其次 info.cTime（OKX毫秒字符串）
+            ts = o.get('timestamp')
+            if ts:
+                return int(ts)
+            info = o.get('info') or {}
+            ctime = info.get('cTime') or info.get('ctime') or info.get('createTime')
+            try:
+                return int(ctime)
+            except Exception:
+                return 0
+        # 旧的在前
+        orders_sorted = sorted(orders, key=ord_ts)
+        to_cancel = orders_sorted[0:max(0, len(orders_sorted)-keep)]
+        canceled = 0
+        for o in to_cancel:
+            oid = o.get('id') or (o.get('info') or {}).get('algoId') or (o.get('info') or {}).get('order_id')
+            if oid:
+                try:
+                    exchange.cancel_order(oid, symbol, params={})
+                    canceled += 1
+                except Exception:
+                    pass
+        if canceled > 0:
+            logger.info(f"{symbol} posSide={pos_side} 保护单超额，已强制收敛撤销={canceled}，保留最新{keep}个")
+        return canceled
+    except Exception as e:
+        logger.debug(f"{symbol} enforce_protection_limit error: {e}")
+        return 0
+
 def mark_existing_protection(symbol, p):
     """
     If exchange already has reduceOnly protective orders for this position, mark attached and set ids.
@@ -913,6 +978,11 @@ def monitor_and_run():
                             pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
                             try:
                                 logger.info(f"{symbol} first attach TP/SL planned: posSide={pos_side_flag}, qty={p['qty']}, SL={desired_sl}, TP={desired_tp}")
+                                # 附加前先清理一遍，防止历史保护单残留
+                                try:
+                                    cancel_all_protection(symbol, pos_side_flag)
+                                except Exception:
+                                    pass
                                 sl_params_once = {'triggerPrice': float(desired_sl), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
                                 tp_params_once = {'triggerPrice': float(desired_tp), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
                                 sl_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=sl_params_once)
@@ -957,6 +1027,12 @@ def monitor_and_run():
                             logger.info(f"{symbol} dynamic check: enabled, changed={changed}, allow_update={allow_update}, gap_sec={gap_sec}, eps={eps}, old(SL/TP)=({p.get('sl_price')}/{p.get('tp_price')}), new=({desired_sl}/{desired_tp})")
 
                             if allow_update and changed:
+                                # 动态更新前，先做一次全面清理，避免叠加
+                                try:
+                                    pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
+                                    cancel_all_protection(symbol, pos_side_flag)
+                                except Exception:
+                                    pass
                                 # cancel previous protective orders if we have ids; 若无id，则从交易所侧筛选并取消
                                 canceled_any = False
                                 ids = [p.get('sl_order_id'), p.get('tp_order_id')]
@@ -1122,6 +1198,17 @@ def monitor_and_run():
                 logger.error(f"Error processing {symbol}: {e}\n{traceback.format_exc()}")
 
         # End for symbols
+
+        # 循环末：对当前所有已记录持仓做保护单数量收敛，最多保留2个（SL+TP）
+        try:
+            for _sym, _p in list(positions.items()):
+                try:
+                    _pside = 'long' if _p.get('side') == 'buy' else 'short'
+                    enforce_protection_limit(_sym, _pside, keep=2)
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
         # 每60秒输出一次账户与持仓看板
         try:
