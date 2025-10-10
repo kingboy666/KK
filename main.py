@@ -25,9 +25,8 @@ class BeijingFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         from datetime import datetime, timezone, timedelta
         dt = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone(timezone(timedelta(hours=8)))
-        if datefmt:
-            return dt.strftime(datefmt)
-        return dt.isoformat(timespec='seconds')
+        # 统一使用“YYYY-MM-DD HH:MM:SS”北京时间，不显示 +08:00
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 handler.setFormatter(BeijingFormatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
@@ -272,10 +271,21 @@ def update_stats_on_close(symbol: str, p: dict, close_px: float, reason: str):
     logger.info(f"{symbol} 已平仓（原因：{reason}），本单已实现盈亏={pnl:.6f}，累计已实现盈亏={stats['realized_pnl']:.6f}，胜率={winrate:.2f}%（{stats['wins']}/{stats['closed_count']}）")
 
 def log_summary(free_usdt: float):
-    # 输出账户与持仓看板
+    # 输出账户与持仓看板（加粗标题风格）
     try:
         winrate = (stats['wins'] / stats['closed_count'] * 100.0) if stats['closed_count'] > 0 else 0.0
-        logger.info(f"账户看板：可用USDT（合约）={free_usdt:.4f}，累计已实现盈亏={stats['realized_pnl']:.6f}，总平仓={stats['closed_count']}，胜率={winrate:.2f}%（胜/总={stats['wins']}/{stats['closed_count']}）")
+        # 汇总未实现盈亏总计
+        total_upnl = 0.0
+        for sym, p in positions.items():
+            try:
+                tk = exchange.fetch_ticker(sym)
+                last_px = tk.get('last') if tk and 'last' in tk else None
+            except Exception:
+                last_px = None
+            total_upnl += compute_unrealized_pnl(sym, p, last_px if last_px is not None else p.get('entry_price'))
+
+        logger.info("========== 账户看板 ==========")
+        logger.info(f"可用USDT（合约）={free_usdt:.4f} | 累计已实现盈亏={stats['realized_pnl']:.6f} | 未实现盈亏总计={total_upnl:.6f} | 总平仓={stats['closed_count']} | 胜率={winrate:.2f}%（{stats['wins']}/{stats['closed_count']}）")
         if positions:
             for sym, p in positions.items():
                 try:
@@ -291,9 +301,10 @@ def log_summary(free_usdt: float):
                 except Exception:
                     cs = 1.0
                 notional_usdt = (float(p.get('qty') or 0) * cs * float(last_px or p.get('entry_price') or 0)) if (last_px or p.get('entry_price')) else 0.0
-                logger.info(f"持仓：{sym} 方向={p.get('side')} 张数={p.get('qty')} 名义≈{notional_usdt:.6f}USDT 入场={p.get('entry_price')} 最新={last_px} 未实现盈亏={upnl:.6f} SL={p.get('sl_price')} TP={p.get('tp_price')}")
+                logger.info(f"持仓：{sym} | 方向={p.get('side')} | 张数={p.get('qty')} | 名义≈{notional_usdt:.6f}USDT | 入场={p.get('entry_price')} | 最新={last_px} | 未实现盈亏={upnl:.6f} | SL={p.get('sl_price')} | TP={p.get('tp_price')}")
         else:
-            logger.info("当前无持仓。")
+            logger.info("（当前无持仓）")
+        logger.info("================================")
     except Exception as e:
         logger.debug(f"输出账户看板时异常：{e}")
 
