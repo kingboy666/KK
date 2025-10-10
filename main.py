@@ -190,6 +190,87 @@ def get_free_balance_usdt():
     return 0.0
 
 # ----------------------------
+# Qty calculation respecting OKX contract size and limits
+# ----------------------------
+def compute_order_amount(symbol, price, notional_usdt):
+    """
+    Compute order amount for OKX swap:
+    - Do NOT multiply by leverage; leverage affects margin, not amount.
+    - Use market.contractSize and limits.amount min/max to size correctly.
+    - Returns a float/int amount already rounded to exchange precision, or None if below minimum.
+    """
+    try:
+        market = None
+        if hasattr(exchange, 'market'):
+            try:
+                market = exchange.market(symbol)
+                if not market or not market.get('active', True):
+                    # ensure markets loaded if needed
+                    exchange.load_markets(reload=False)
+                    market = exchange.market(symbol)
+            except Exception:
+                try:
+                    exchange.load_markets(reload=True)
+                    market = exchange.market(symbol)
+                except Exception:
+                    market = None
+
+        if price is None or price <= 0:
+            return None
+
+        # base quantity needed for target notional
+        base_qty = notional_usdt / price
+
+        # contract sizing
+        amount = base_qty
+        contract_size = None
+        if isinstance(market, dict):
+            contract_size = market.get('contractSize')
+            if contract_size and contract_size > 0:
+                # amount should be number of contracts (integer)
+                amount = math.floor(base_qty / contract_size)
+
+        # apply min/max limits
+        min_amt = None
+        max_amt = None
+        if isinstance(market, dict):
+            limits = market.get('limits') or {}
+            amt_limits = limits.get('amount') or {}
+            min_amt = amt_limits.get('min')
+            max_amt = amt_limits.get('max')
+
+        # if contractSize present, ensure integer
+        if contract_size and contract_size > 0:
+            amount = max(0, int(amount))
+
+        # enforce min
+        if min_amt is not None:
+            if amount < min_amt:
+                # if we can bump to min, do so; else return None to skip
+                amount = min_amt
+
+        # enforce max
+        clamped = False
+        if max_amt is not None and amount > max_amt:
+            amount = max_amt
+            clamped = True
+
+        # precision rounding via ccxt helper if available
+        try:
+            amount = float(exchange.amount_to_precision(symbol, amount))
+        except Exception:
+            # fallback: keep as-is
+            pass
+
+        if amount is None or amount <= 0:
+            return None
+
+        return amount, clamped
+    except Exception as e:
+        logger.warning(f"compute_order_amount error for {symbol}: {e}")
+        return None
+
+# ----------------------------
 # Order placement: entry + exchange conditional SL/TP
 # ----------------------------
 def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage, sl_price, tp_price):
@@ -208,20 +289,49 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
             # fallback: place market order and rely on exchange fill
             entry_est_price = 0.0
 
-        # Calculate qty: for perpetuals, notional_usdt * leverage / price = contract notional
-        # Note: OKX uses "size" in contracts or base-quantity depending on market; this is a best-effort approach.
-        if entry_est_price and entry_est_price > 0:
-            qty = (notional_usdt * leverage) / entry_est_price
-        else:
-            qty = max(1.0, (notional_usdt * leverage))  # best-effort fallback
+        # Calculate qty correctly for OKX swaps (do NOT multiply by leverage)
+        # ensure we have a valid price for sizing
+        price_for_size = entry_est_price
+        if not price_for_size or price_for_size <= 0:
+            try:
+                _tk = exchange.fetch_ticker(symbol)
+                price_for_size = _tk.get('last') if _tk and 'last' in _tk else None
+            except Exception:
+                price_for_size = None
+        qty_info = compute_order_amount(symbol, price_for_size, notional_usdt)
+        if not qty_info:
+            logger.warning(f"{symbol} computed amount below minimum or invalid; skipping entry.")
+            return {'entry_order': None, 'filled_qty': 0, 'entry_price': entry_est_price, 'sl_order': None, 'tp_order': None}
+        qty, was_clamped = qty_info
+        if was_clamped:
+            logger.warning(f"{symbol} order amount clamped to exchange max amount to avoid 51202.")
 
-        # Place market order
+        # Place market order (try attach TP/SL at creation for OKX via ccxt)
         pos_side = 'long' if side == 'buy' else 'short'
+        attached_ok = False
         try:
-            order = exchange.create_market_order(symbol, side, qty, params={'tdMode': 'cross', 'posSide': pos_side})
+            order = exchange.create_order(
+                symbol,
+                'market',
+                side,
+                qty,
+                None,
+                params={
+                    'tdMode': 'cross',
+                    'posSide': pos_side,
+                    'takeProfit': {'triggerPrice': float(tp_price), 'price': '-1'},
+                    'stopLoss': {'triggerPrice': float(sl_price), 'price': '-1'},
+                },
+            )
+            attached_ok = True
+            logger.info("Attached TP/SL to entry order via ccxt params.")
         except Exception as e:
-            logger.warning(f"market order creation raised: {e}; trying create_order('market') fallback")
-            order = exchange.create_order(symbol, 'market', side, qty, None, params={'tdMode': 'cross', 'posSide': pos_side})
+            logger.warning(f"attach TP/SL at entry failed: {e}; falling back to plain market + separate conditionals")
+            try:
+                order = exchange.create_market_order(symbol, side, qty, params={'tdMode': 'cross', 'posSide': pos_side})
+            except Exception as e2:
+                logger.warning(f"market order creation raised: {e2}; trying create_order('market') fallback")
+                order = exchange.create_order(symbol, 'market', side, qty, None, params={'tdMode': 'cross', 'posSide': pos_side})
 
         # Determine filled qty and avg price
         filled_qty = None
@@ -246,6 +356,17 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
         client_base = f"auto_{int(time.time()*1000)}"
         sl_order = None
         tp_order = None
+
+        if attached_ok:
+            logger.info("Entry TP/SL attached at order creation; skipping separate conditional orders.")
+            result = {
+                'entry_order': order,
+                'filled_qty': filled_qty,
+                'entry_price': entry_price,
+                'sl_order': None,
+                'tp_order': None,
+            }
+            return result
 
         # attempt variation 1: common param names
         sl_params_try = {
