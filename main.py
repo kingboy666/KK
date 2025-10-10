@@ -170,9 +170,9 @@ def fetch_ohlcv(symbol, timeframe, limit=BARS_LIMIT, since=None):
             return df
         except Exception as e:
             attempts += 1
-            logger.warning(f"fetch_ohlcv error {symbol} attempt {attempts}: {e}")
+            logger.debug(f"fetch_ohlcv error {symbol} attempt {attempts}: {e}")
             time.sleep(1 + attempts)
-    logger.error(f"fetch_ohlcv failed for {symbol}")
+    logger.debug(f"fetch_ohlcv failed for {symbol}")
     return None
 
 def compute_atr(df, period=ATR_PERIOD):
@@ -361,11 +361,83 @@ def fetch_open_reduce_only(symbol, pos_side):
         logger.debug(f"{symbol} fetch_open_reduce_only error: {e}")
         return []
 
+def okx_inst_id(symbol: str) -> str:
+    # OKX 合约 instId 形如 BTC-USDT-SWAP
+    try:
+        s = symbol.replace("/", "-")
+        if not s.endswith("-SWAP"):
+            s = f"{s}-SWAP"
+        return s
+    except Exception:
+        return symbol
+
+def fetch_okx_algo_protections(symbol: str, pos_side: str):
+    """
+    读取 OKX 待触发的计划委托/止盈止损（algo）并按 posSide 过滤。
+    返回列表元素统一为 dict，含 algoId、posSide、cTime。
+    """
+    out = []
+    try:
+        if hasattr(exchange, 'private_get_trade_orders_algo_pending'):
+            inst_id = okx_inst_id(symbol)
+            # 常见 ordType: conditional/oco
+            resp = exchange.private_get_trade_orders_algo_pending({'instType': 'SWAP', 'instId': inst_id})
+            data = (resp or {}).get('data') or resp or []
+            if isinstance(data, list):
+                for it in data:
+                    try:
+                        ps = str(it.get('posSide') or it.get('positionSide') or '').lower()
+                        if ps == str(pos_side).lower():
+                            out.append({
+                                'algoId': it.get('algoId') or it.get('algo_id'),
+                                'posSide': ps,
+                                'cTime': it.get('cTime') or it.get('ctime') or it.get('createTime') or '0',
+                                'info': it
+                            })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return out
+
+def cancel_okx_algos(symbol: str, algos: list) -> int:
+    """
+    使用 OKX 原生接口撤销 algo 计划委托/止盈止损。
+    """
+    canceled = 0
+    if not algos:
+        return 0
+    inst_id = okx_inst_id(symbol)
+    # 尝试逐个撤销，兼容不同 ccxt 版本的参数格式
+    for a in algos:
+        aid = a.get('algoId') or (a.get('info') or {}).get('algoId')
+        if not aid:
+            continue
+        try:
+            if hasattr(exchange, 'private_post_trade_cancel_algos'):
+                # 两种可能的 payload 结构，逐一尝试
+                try:
+                    exchange.private_post_trade_cancel_algos({'algoId': [aid], 'instId': inst_id})
+                except Exception:
+                    exchange.private_post_trade_cancel_algos({'algoIds': [{'algoId': aid, 'instId': inst_id}]})
+                canceled += 1
+            else:
+                # 兜底：尝试常规 cancel_order（多数情况下对 algo 无效）
+                try:
+                    exchange.cancel_order(aid, symbol, params={})
+                    canceled += 1
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return canceled
+
 def cancel_all_protection(symbol, pos_side):
     """
-    撤掉同 symbol + posSide 的所有保护单（reduceOnly 或 OKX 条件单），返回撤单数量。
+    撤掉同 symbol + posSide 的所有保护单（reduceOnly 及 OKX 条件单），返回撤单总数。
     """
     try:
+        # 1) 通过统一 open_orders 方式撤普通 reduceOnly/条件单
         orders = fetch_open_reduce_only(symbol, pos_side) or []
         canceled = 0
         for o in orders:
@@ -376,10 +448,15 @@ def cancel_all_protection(symbol, pos_side):
                         exchange.cancel_order(oid, symbol, params={})
                         canceled += 1
                     except Exception:
-                        # 某些条件单 id 可能不可直接取消，忽略单条失败
                         pass
             except Exception:
                 continue
+        # 2) 专门清理 OKX algo（计划委托/止盈止损）
+        try:
+            algo_list = fetch_okx_algo_protections(symbol, pos_side)
+            canceled += cancel_okx_algos(symbol, algo_list)
+        except Exception:
+            pass
         if canceled > 0:
             logger.info(f"{symbol} posSide={pos_side} 已清理保护单数量={canceled}")
         return canceled
@@ -390,35 +467,52 @@ def cancel_all_protection(symbol, pos_side):
 def enforce_protection_limit(symbol, pos_side, keep=2):
     """
     强制限制保护单数量，默认最多保留 keep 个（通常 SL+TP=2）。返回撤销数量。
-    策略：按时间从旧到新排序，保留最新的 keep 个，撤掉其余。
+    同时考虑：
+      - 普通 reduceOnly/条件单（fetch_open_orders）
+      - OKX algo 计划委托/止盈止损（orders-algo-pending）
     """
     try:
-        orders = fetch_open_reduce_only(symbol, pos_side) or []
-        if len(orders) <= keep:
-            return 0
-        def ord_ts(o):
-            # 优先使用标准 timestamp，其次 info.cTime（OKX毫秒字符串）
-            ts = o.get('timestamp')
-            if ts:
-                return int(ts)
-            info = o.get('info') or {}
-            ctime = info.get('cTime') or info.get('ctime') or info.get('createTime')
+        # 拉取两类保护单并合并视图
+        normal_orders = fetch_open_reduce_only(symbol, pos_side) or []
+        algo_orders = fetch_okx_algo_protections(symbol, pos_side) or []
+
+        # 统一构造 (kind, id, ts) 列表，kind in {'normal','algo'}
+        items = []
+        for o in normal_orders:
             try:
-                return int(ctime)
+                oid = o.get('id') or (o.get('info') or {}).get('order_id') or (o.get('info') or {}).get('algoId')
+                ts = o.get('timestamp') or 0
+                items.append(('normal', oid, int(ts), o))
             except Exception:
-                return 0
-        # 旧的在前
-        orders_sorted = sorted(orders, key=ord_ts)
-        to_cancel = orders_sorted[0:max(0, len(orders_sorted)-keep)]
+                continue
+        for a in algo_orders:
+            try:
+                oid = a.get('algoId')
+                ts = int(a.get('cTime') or 0)
+                items.append(('algo', oid, ts, a))
+            except Exception:
+                continue
+
+        if len(items) <= keep:
+            return 0
+
+        # 时间从旧到新
+        items_sorted = sorted(items, key=lambda x: (x[2] or 0))
+        to_cancel = items_sorted[0:max(0, len(items_sorted)-keep)]
         canceled = 0
-        for o in to_cancel:
-            oid = o.get('id') or (o.get('info') or {}).get('algoId') or (o.get('info') or {}).get('order_id')
-            if oid:
-                try:
+        # 分别用不同方式撤销
+        for kind, oid, _ts, obj in to_cancel:
+            if not oid:
+                continue
+            try:
+                if kind == 'normal':
                     exchange.cancel_order(oid, symbol, params={})
                     canceled += 1
-                except Exception:
-                    pass
+                else:
+                    canceled += cancel_okx_algos(symbol, [obj])
+            except Exception:
+                continue
+
         if canceled > 0:
             logger.info(f"{symbol} posSide={pos_side} 保护单超额，已强制收敛撤销={canceled}，保留最新{keep}个")
         return canceled
@@ -433,7 +527,7 @@ def mark_existing_protection(symbol, p):
     """
     pos_side_flag = 'long' if p.get('side') == 'buy' else 'short'
     existing = fetch_open_reduce_only(symbol, pos_side_flag)
-    logger.info(f"{symbol} posSide={pos_side_flag} open protection orders detected: {len(existing)}")
+    logger.debug(f"{symbol} posSide={pos_side_flag} open protection orders detected: {len(existing)}")
     if existing:
         # Try to map ids
         for o in existing:
@@ -806,12 +900,12 @@ def monitor_and_run():
                 # fetch recent OHLCV
                 df = fetch_ohlcv(symbol, tf, limit=BARS_LIMIT)
                 if df is None or len(df) < ATR_PERIOD + CONFIRM_CANDLES + 2:
-                    logger.warning(f"{symbol} insufficient data for timeframe {tf}. Skipping.")
+                    logger.debug(f"{symbol} insufficient data for timeframe {tf}. Skipping.")
                     continue
                 atr = compute_atr(df, ATR_PERIOD)
                 current_atr = atr.iloc[-1]
                 if math.isnan(current_atr) or current_atr <= 0:
-                    logger.warning(f"{symbol} ATR invalid: {current_atr}. Skip.")
+                    logger.debug(f"{symbol} ATR invalid: {current_atr}. Skip.")
                     continue
                 # detect signal
                 signal = detect_kline_momentum(df)
@@ -929,9 +1023,9 @@ def monitor_and_run():
                     if not p.get('tp_sl_attached'):
                         try:
                             if mark_existing_protection(symbol, p):
-                                logger.info(f"{symbol} detected existing exchange TP/SL; skip re-attach.")
+                                logger.debug(f"{symbol} detected existing exchange TP/SL; skip re-attach.")
                             else:
-                                logger.info(f"{symbol} no existing exchange TP/SL detected; will consider first attach if not attempted.")
+                                logger.debug(f"{symbol} no existing exchange TP/SL detected; will consider first attach if not attempted.")
                         except Exception as e:
                             logger.debug(f"{symbol} protection detection error: {e}")
 
@@ -971,7 +1065,7 @@ def monitor_and_run():
                                 trail_sl_candidate = trail_sl
                                 # 只下移，不上移
                                 desired_sl = min(desired_sl, trail_sl)
-                            logger.info(f"{symbol} trailing refs: side={p.get('side')}, highest={p.get('highest_since_entry')}, lowest={p.get('lowest_since_entry')}, atr={atr_latest}, trail_mult={TRAIL_MULT}, trail_dist={trail_dist}, trail_sl_candidate={trail_sl_candidate}, desired_sl={desired_sl}")
+                            logger.debug(f"{symbol} trailing refs: side={p.get('side')}, highest={p.get('highest_since_entry')}, lowest={p.get('lowest_since_entry')}, atr={atr_latest}, trail_mult={TRAIL_MULT}, trail_dist={trail_dist}, trail_sl_candidate={trail_sl_candidate}, desired_sl={desired_sl}")
 
                         # 1) Attach once if not yet attached and not attempted
                         if (not p.get('tp_sl_attached')) and (not p.get('tp_sl_attempted')):
@@ -1024,7 +1118,7 @@ def monitor_and_run():
 
                             eps = max(1e-8, abs(p.get('sl_price', desired_sl)) * 0.001)  # 放宽阈值，避免微小波动频繁更新
                             changed = (abs(desired_sl - p.get('sl_price', desired_sl)) > eps) or (abs(desired_tp - p.get('tp_price', desired_tp)) > eps)
-                            logger.info(f"{symbol} dynamic check: enabled, changed={changed}, allow_update={allow_update}, gap_sec={gap_sec}, eps={eps}, old(SL/TP)=({p.get('sl_price')}/{p.get('tp_price')}), new=({desired_sl}/{desired_tp})")
+                            logger.debug(f"{symbol} dynamic check: enabled, changed={changed}, allow_update={allow_update}, gap_sec={gap_sec}, eps={eps}, old(SL/TP)=({p.get('sl_price')}/{p.get('tp_price')}), new=({desired_sl}/{desired_tp})")
 
                             if allow_update and changed:
                                 # 动态更新前，先做一次全面清理，避免叠加
