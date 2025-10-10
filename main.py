@@ -1751,6 +1751,14 @@ def monitor_and_run():
 # Entry point
 # ----------------------------
 if __name__ == "__main__":
+    # 打印脚本路径与SHA256前16位，便于确认部署版本
+    try:
+        import hashlib, pathlib
+        p = pathlib.Path(__file__).resolve()
+        h = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        logger.info(f"启动脚本: {p} sha256[:16]={h}")
+    except Exception as _e_hash:
+        print(f"无法打印脚本哈希: {_e_hash}")
     try:
         logger.info("Starting K-line Momentum bot (exchange-side conditional orders). SANDBOX=%s" % (SANDBOX,))
         monitor_and_run()
