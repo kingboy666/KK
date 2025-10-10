@@ -494,6 +494,93 @@ def okx_inst_id(symbol: str) -> str:
     except Exception:
         return str(symbol)
 
+def okx_align_triggers(symbol: str, side: str, tp_price: float, sl_price: float):
+    """
+    根据 OKX tickSize/precision 与最新价，对 TP/SL 触发价做安全对齐与钳制，避免 51250。
+    side: 'buy' 多单 or 'sell' 空单（与下单方向一致）
+    返回: (adj_tp, adj_sl)
+    """
+    try:
+        # 获取 tick 大小
+        tick = None
+        try:
+            mkt = exchange.market(symbol)
+            if isinstance(mkt, dict):
+                info = mkt.get('info') or {}
+                tick = info.get('tickSz') or info.get('tickSize') or None
+                if not tick:
+                    prec = mkt.get('precision') or {}
+                    p = prec.get('price')
+                    if isinstance(p, (int, float)) and p >= 0:
+                        tick = 10 ** (-int(p))
+        except Exception:
+            pass
+        if not tick:
+            # 容错：估个常见最小精度
+            tick = 0.0001
+
+        # 最新价
+        try:
+            tk = exchange.fetch_ticker(symbol)
+            last = tk.get('last') if tk and 'last' in tk else None
+        except Exception:
+            last = None
+
+        def round_to_tick(x, up=False):
+            try:
+                x = float(x)
+                inv = 1.0 / float(tick)
+                return (math.ceil(x * inv) / inv) if up else (math.floor(x * inv) / inv)
+            except Exception:
+                return float(x)
+
+        adj_tp, adj_sl = float(tp_price), float(sl_price)
+
+        # 方向性与最小距离（2个tick）
+        min_gap = 2.0 * float(tick)
+        if last:
+            last = float(last)
+            if str(side).lower() == 'buy':
+                # 多单：tp >= last + 2tick，sl <= last - 2tick
+                adj_tp = max(adj_tp, last + min_gap)
+                adj_sl = min(adj_sl, last - min_gap)
+                adj_tp = round_to_tick(adj_tp, up=True)
+                adj_sl = round_to_tick(adj_sl, up=False)
+            else:
+                # 空单：tp <= last - 2tick，sl >= last + 2tick
+                adj_tp = min(adj_tp, last - min_gap)
+                adj_sl = max(adj_sl, last + min_gap)
+                adj_tp = round_to_tick(adj_tp, up=False)
+                adj_sl = round_to_tick(adj_sl, up=True)
+        else:
+            # 无 last 时，仅按 tick 对齐，保持方向大致正确
+            if str(side).lower() == 'buy':
+                adj_tp = round_to_tick(adj_tp, up=True)
+                adj_sl = round_to_tick(adj_sl, up=False)
+            else:
+                adj_tp = round_to_tick(adj_tp, up=False)
+                adj_sl = round_to_tick(adj_sl, up=True)
+
+        # 价格上下限夹取（若市场数据提供）
+        try:
+            mkt = exchange.market(symbol)
+            limits = (mkt.get('limits') or {}).get('price') or {}
+            pmin = limits.get('min')
+            pmax = limits.get('max')
+            if pmin is not None:
+                adj_tp = max(adj_tp, float(pmin))
+                adj_sl = max(adj_sl, float(pmin))
+            if pmax is not None:
+                adj_tp = min(adj_tp, float(pmax))
+                adj_sl = min(adj_sl, float(pmax))
+        except Exception:
+            pass
+
+        return float(adj_tp), float(adj_sl)
+    except Exception:
+        # 兜底：直接返回原值
+        return float(tp_price), float(sl_price)
+
 def fetch_okx_algo_protections(symbol: str, pos_side: str):
     """
     读取 OKX 待触发的计划委托/止盈止损（algo）并按 posSide 过滤。
@@ -647,25 +734,32 @@ def enforce_protection_limit(symbol, pos_side, keep=2):
 
 def mark_existing_protection(symbol, p):
     """
-    If exchange already has reduceOnly protective orders for this position, mark attached and set ids.
-    Returns True if found any.
+    若交易所已存在该 symbol+posSide 的保护单（含 OKX algo 计划委托/止盈止损），
+    标记为已附加并尽力记录一个 id。返回 True 表示已检测到并标记。
     """
     pos_side_flag = 'long' if p.get('side') == 'buy' else 'short'
-    existing = fetch_open_reduce_only(symbol, pos_side_flag)
-    logger.debug(f"{symbol} posSide={pos_side_flag} open protection orders detected: {len(existing)}")
-    if existing:
-        # Try to map ids
-        for o in existing:
+    # 1) 常规 open_orders 中的 reduceOnly/条件单
+    existing_normal = fetch_open_reduce_only(symbol, pos_side_flag) or []
+    # 2) OKX 原生 algo 待触发的 TP/SL
+    existing_algo = fetch_okx_algo_protections(symbol, pos_side_flag) or []
+    total = len(existing_normal) + len(existing_algo)
+    logger.debug(f"{symbol} posSide={pos_side_flag} open protection detected (normal+algo): {len(existing_normal)}+{len(existing_algo)}={total}")
+    if total > 0:
+        # 尽力放一个/两个 id 以便后续清理
+        for o in existing_normal:
             oid = o.get('id') or (o.get('info') or {}).get('algoId') or (o.get('info') or {}).get('order_id')
-            if not oid:
-                continue
-            # 先尽力放到本地结构里，无法区分SL/TP也问题不大，标记为已附加即可
-            if not p.get('sl_order_id'):
+            if oid and not p.get('sl_order_id'):
                 p['sl_order_id'] = oid
-            elif not p.get('tp_order_id'):
-                p['tp_order_id'] = oid
+                break
+        if existing_algo and not p.get('tp_order_id'):
+            a0 = existing_algo[0]
+            aid = a0.get('algoId') or (a0.get('info') or {}).get('algoId')
+            if aid:
+                p['tp_order_id'] = aid
         p['tp_sl_attached'] = True
         p['tp_sl_attempted'] = True
+        if not p.get('tp_sl_updated_at'):
+            p['tp_sl_updated_at'] = datetime.now(timezone.utc).isoformat()
         return True
     return False
 
@@ -861,14 +955,8 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
                 pass
             # 组织 OCO 参数（执行价设为 -1 表示市价）
             inst_id = okx_inst_id(symbol)
-            # 对触发价进行方向性钳制与精度对齐（尽量减少风控错误），采用简单安全回退：仅四舍五入至 1e-4
-            try:
-                price_prec = 4
-                tick = 10 ** (-price_prec)
-                sl_price = math.floor(float(sl_price) / tick) * tick if side == 'buy' else math.ceil(float(sl_price) / tick) * tick
-                tp_price = math.ceil(float(tp_price) / tick) * tick if side == 'buy' else math.floor(float(tp_price) / tick) * tick
-            except Exception:
-                pass
+            # 使用安全对齐函数，避免 51250 超范围
+            adj_tp, adj_sl = okx_align_triggers(symbol, side, float(tp_price), float(sl_price))
             payload = {
                 'instId': inst_id,
                 'tdMode': 'cross',
@@ -877,9 +965,9 @@ def place_market_entry_with_exchange_tp_sl(symbol, side, notional_usdt, leverage
                 'ordType': 'oco',
                 'reduceOnly': True,
                 'sz': str(filled_qty),
-                'tpTriggerPx': str(tp_price),
+                'tpTriggerPx': str(adj_tp),
                 'tpOrdPx': '-1',
-                'slTriggerPx': str(sl_price),
+                'slTriggerPx': str(adj_sl),
                 'slOrdPx': '-1',
             }
             # 兼容 ccxt 原生私有接口命名
@@ -1198,26 +1286,73 @@ def monitor_and_run():
                         if (not p.get('tp_sl_attached')) and (not p.get('tp_sl_attempted')):
                             pos_side_flag = 'long' if p['side'] == 'buy' else 'short'
                             try:
-                                logger.info(f"{symbol} first attach TP/SL planned: posSide={pos_side_flag}, qty={p['qty']}, SL={desired_sl}, TP={desired_tp}")
-                                # 附加前先清理一遍，防止历史保护单残留
-                                try:
-                                    cancel_all_protection(symbol, pos_side_flag)
-                                except Exception:
-                                    pass
-                                sl_params_once = {'triggerPrice': float(desired_sl), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
-                                tp_params_once = {'triggerPrice': float(desired_tp), 'reduceOnly': True, 'closeOnTrigger': True, 'tdMode': 'cross', 'posSide': pos_side_flag}
-                                sl_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=sl_params_once)
-                                tp_o = exchange.create_order(symbol, type='market', side=('sell' if p['side']=='buy' else 'buy'), amount=p['qty'], price=None, params=tp_params_once)
-                                p['sl_order'] = sl_o; p['tp_order'] = tp_o
-                                if isinstance(sl_o, dict): p['sl_order_id'] = sl_o.get('id') or sl_o.get('algoId') or sl_o.get('order_id')
-                                if isinstance(tp_o, dict): p['tp_order_id'] = tp_o.get('id') or tp_o.get('algoId') or tp_o.get('order_id')
-                                p['tp_sl_attached'] = True
-                                p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
-                                logger.info(f"{symbol} attached exchange-side TP/SL after entry (once). sl_id={p.get('sl_order_id')} tp_id={p.get('tp_order_id')}")
+                                # 硬保护：若已存在任何 algo 保护单，则直接标记并跳过创建
+                                existing_algo = fetch_okx_algo_protections(symbol, pos_side_flag) or []
+                                if existing_algo:
+                                    p['tp_sl_attached'] = True
+                                    p['tp_sl_attempted'] = True
+                                    if not p.get('tp_sl_updated_at'):
+                                        p['tp_sl_updated_at'] = datetime.now(timezone.utc).isoformat()
+                                    logger.info(f"{symbol} 已存在交易所侧保护单（algo>=1），首次附加跳过。")
+                                    # 也同步一次价格到本地，避免本地兜底误触
+                                    p['sl_price'] = desired_sl; p['tp_price'] = desired_tp
+                                else:
+                                    logger.info(f"{symbol} 首次附加TP/SL：posSide={pos_side_flag}, qty={p['qty']}, SL={desired_sl}, TP={desired_tp}")
+                                    # 附加前清理一次并小延迟
+                                    try:
+                                        cancel_all_protection(symbol, pos_side_flag)
+                                        time.sleep(0.3)
+                                    except Exception:
+                                        pass
+                                    # 冷却检查
+                                    try:
+                                        now_dt = datetime.now(timezone.utc)
+                                        key = (symbol, pos_side_flag)
+                                        last_cd = protection_cooldown_map.get(key)
+                                        if last_cd and (now_dt - last_cd).total_seconds() < PROTECTION_COOLDOWN_SEC:
+                                            left = int(PROTECTION_COOLDOWN_SEC - (now_dt - last_cd).total_seconds())
+                                            logger.info(f"{symbol} 保护单冷却中（剩余{left}秒），跳过首次附加。")
+                                        else:
+                                            protection_cooldown_map[key] = now_dt
+                                            # 使用 OCO + 触发价对齐
+                                            inst_id = okx_inst_id(symbol)
+                                            adj_tp, adj_sl = okx_align_triggers(symbol, p['side'], float(desired_tp), float(desired_sl))
+                                            payload = {
+                                                'instId': inst_id,
+                                                'tdMode': 'cross',
+                                                'posSide': pos_side_flag,
+                                                'side': ('sell' if p['side']=='buy' else 'buy'),
+                                                'ordType': 'oco',
+                                                'reduceOnly': True,
+                                                'sz': str(p['qty']),
+                                                'tpTriggerPx': str(adj_tp),
+                                                'tpOrdPx': '-1',
+                                                'slTriggerPx': str(adj_sl),
+                                                'slOrdPx': '-1',
+                                            }
+                                            if hasattr(exchange, 'private_post_trade_order_algo'):
+                                                resp_once = exchange.private_post_trade_order_algo(payload)
+                                            elif hasattr(exchange, 'privatePostTradeOrderAlgo'):
+                                                resp_once = exchange.privatePostTradeOrderAlgo(payload)
+                                            else:
+                                                resp_once = None
+                                            ok_once = False
+                                            if isinstance(resp_once, dict):
+                                                code_o = str(resp_once.get('code', ''))
+                                                ok_once = (code_o == '0' or code_o == '200' or (resp_once.get('data') and (code_o == '' or code_o == '0')))
+                                            else:
+                                                ok_once = bool(resp_once)
+                                            if ok_once:
+                                                p['tp_sl_attached'] = True
+                                                p['tp_sl_attempted'] = True
+                                                p['tp_sl_updated_at'] = datetime.now(timezone.utc).isoformat()
+                                                p['sl_price'] = adj_sl; p['tp_price'] = adj_tp
+                                                logger.info(f"{symbol} 首次使用 OCO 成功附加TP/SL。")
+                                            else:
+                                                logger.warning(f"{symbol} 首次OCO附加失败：{resp_once}（将依赖后续检测/动态更新）")
+                                                p['tp_sl_attempted'] = True
                             except Exception as ex_attach_once:
                                 logger.warning(f"{symbol} attach TP/SL after entry failed: {ex_attach_once}")
-                            finally:
-                                p['tp_sl_attempted'] = True
 
                         # 2) Dynamic update: if enabled and prices changed materially, cancel old and re-place new
                         elif is_dynamic_enabled(symbol) and p.get('tp_sl_attached'):
@@ -1297,14 +1432,8 @@ def monitor_and_run():
                                 try:
                                     # 使用 OKX 原生 OCO 重新挂 TP/SL
                                     inst_id = okx_inst_id(symbol)
-                                    # 简单精度对齐
-                                    try:
-                                        price_prec = 4
-                                        tick = 10 ** (-price_prec)
-                                        desired_sl = math.floor(float(desired_sl) / tick) * tick if p['side'] == 'buy' else math.ceil(float(desired_sl) / tick) * tick
-                                        desired_tp = math.ceil(float(desired_tp) / tick) * tick if p['side'] == 'buy' else math.floor(float(desired_tp) / tick) * tick
-                                    except Exception:
-                                        pass
+                                    # 安全对齐触发价，避免 51250
+                                    adj_tp, adj_sl = okx_align_triggers(symbol, p['side'], float(desired_tp), float(desired_sl))
                                     payload = {
                                         'instId': inst_id,
                                         'tdMode': 'cross',
@@ -1313,9 +1442,9 @@ def monitor_and_run():
                                         'ordType': 'oco',
                                         'reduceOnly': True,
                                         'sz': str(p['qty']),
-                                        'tpTriggerPx': str(desired_tp),
+                                        'tpTriggerPx': str(adj_tp),
                                         'tpOrdPx': '-1',
-                                        'slTriggerPx': str(desired_sl),
+                                        'slTriggerPx': str(adj_sl),
                                         'slOrdPx': '-1',
                                     }
                                     if hasattr(exchange, 'private_post_trade_order_algo'):
