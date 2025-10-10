@@ -215,15 +215,28 @@ stats = {
 last_summary_ts = 0
 
 def compute_unrealized_pnl(symbol: str, p: dict, last_px: float) -> float:
+    """
+    线性USDT本位合约 PnL:
+      多单: (last - entry) * 张数 * contractSize
+      空单: (entry - last) * 张数 * contractSize
+    若取不到 contractSize, 回退为现货近似 (不推荐, 但保证不中断)。
+    """
     try:
         qty = float(p.get('qty') or 0)
         entry = float(p.get('entry_price') or 0)
         if qty <= 0 or entry <= 0 or last_px is None:
             return 0.0
+        # 尝试获取合约张价值
+        cs = 1.0
+        try:
+            mkt = exchange.market(symbol)
+            cs = float(mkt.get('contractSize') or 1.0)
+        except Exception:
+            cs = 1.0
         if p.get('side') == 'buy':
-            return (last_px - entry) * qty
+            return (float(last_px) - entry) * qty * cs
         else:
-            return (entry - last_px) * qty
+            return (entry - float(last_px)) * qty * cs
     except Exception:
         return 0.0
 
@@ -252,7 +265,14 @@ def log_summary(free_usdt: float):
                 except Exception:
                     last_px = None
                 upnl = compute_unrealized_pnl(sym, p, last_px if last_px is not None else p.get('entry_price'))
-                logger.info(f"持仓：{sym} 方向={p.get('side')} 数量={p.get('qty')} 入场={p.get('entry_price')} 最新={last_px} 未实现盈亏={upnl:.6f} SL={p.get('sl_price')} TP={p.get('tp_price')}")
+                # 计算名义≈USDT（张数×contractSize×最新价）
+                try:
+                    mkt = exchange.market(sym)
+                    cs = float(mkt.get('contractSize') or 1.0)
+                except Exception:
+                    cs = 1.0
+                notional_usdt = (float(p.get('qty') or 0) * cs * float(last_px or p.get('entry_price') or 0)) if (last_px or p.get('entry_price')) else 0.0
+                logger.info(f"持仓：{sym} 方向={p.get('side')} 张数={p.get('qty')} 名义≈{notional_usdt:.6f}USDT 入场={p.get('entry_price')} 最新={last_px} 未实现盈亏={upnl:.6f} SL={p.get('sl_price')} TP={p.get('tp_price')}")
         else:
             logger.info("当前无持仓。")
     except Exception as e:
