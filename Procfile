@@ -1,0 +1,1 @@
+worker: python -u K线策略.py
