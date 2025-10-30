@@ -118,17 +118,17 @@ TRAIL_DD_PCT = float(os.environ.get('TRAIL_DD_PCT', '0.05').strip() or 0.05)  # 
 TRAIL_REQUIRE_PROFIT = os.environ.get('TRAIL_REQUIRE_PROFIT', 'true').strip().lower() in ('1', 'true', 'yes')  # 仅在持仓为正收益时触发
 
 # 布林带参数
-BB_PERIOD = int(os.environ.get('BB_PERIOD', '18').strip() or 18)
-BB_STD = float(os.environ.get('BB_STD', '2.0').strip() or 2.0)
+BB_PERIOD = int(os.environ.get('BB_PERIOD', '14').strip() or 14)
+BB_STD = float(os.environ.get('BB_STD', '2.5').strip() or 2.5)
 BB_SLOPE_PERIOD = int(os.environ.get('BB_SLOPE_PERIOD', '5').strip() or 5)
 # ADX 过滤参数
 ADX_PERIOD = int(os.environ.get('ADX_PERIOD', '14').strip() or 14)
-ADX_MIN_TREND = float(os.environ.get('ADX_MIN_TREND', '20').strip() or 20)
+ADX_MIN_TREND = float(os.environ.get('ADX_MIN_TREND', '15').strip() or 15)
 # ATR 参数
 ATR_PERIOD = int(os.environ.get('ATR_PERIOD', '14').strip() or 14)
 
 # 趋势判断阈值
-SLOPE_UP_THRESH = float(os.environ.get('SLOPE_UP_THRESH', '0.0015').strip() or 0.0015)
+SLOPE_UP_THRESH = float(os.environ.get('SLOPE_UP_THRESH', '0.0008').strip() or 0.0008)
 SLOPE_DOWN_THRESH = float(os.environ.get('SLOPE_DOWN_THRESH', '-0.0015').strip() or -0.0015)
 SLOPE_FLAT_RANGE = float(os.environ.get('SLOPE_FLAT_RANGE', '0.0008').strip() or 0.0008)
 
@@ -140,11 +140,11 @@ BANDWIDTH_SQUEEZE_THRESH = float(os.environ.get('BANDWIDTH_SQUEEZE_THRESH', '-0.
 PRICE_TOLERANCE = float(os.environ.get('PRICE_TOLERANCE', '0.002').strip() or 0.002)
 
 # 震荡市增强确认参数
-MIN_RISK_REWARD = float(os.environ.get('MIN_RISK_REWARD', '2.0').strip() or 2.0)  # 最小盈亏比
+MIN_RISK_REWARD = float(os.environ.get('MIN_RISK_REWARD', '1.2').strip() or 1.2)  # 最小盈亏比
 HAMMER_SHADOW_RATIO = float(os.environ.get('HAMMER_SHADOW_RATIO', '2.0').strip() or 2.0)  # 锤子线影线/实体比
 
 # 下降趋势抢反弹开关
-ENABLE_DOWNTREND_BOUNCE = os.environ.get('ENABLE_DOWNTREND_BOUNCE', 'false').strip().lower() in ('1', 'true', 'yes')
+ENABLE_DOWNTREND_BOUNCE = os.environ.get('ENABLE_DOWNTREND_BOUNCE', 'true').strip().lower() in ('1', 'true', 'yes')
 DOWNTREND_POSITION_RATIO = float(os.environ.get('DOWNTREND_POSITION_RATIO', '0.3').strip() or 0.3)
 
 TIMEFRAME = '15m'
@@ -945,14 +945,12 @@ while True:
                         stop_est = curr_lower - (SL_ATR_MULTIPLIER * curr_atr)
                         risk_reward = calculate_risk_reward(entry_est, target_est, stop_est)
                         
-                        if lower_touch_prev and lower_reject_now and has_hammer and risk_reward >= MIN_RISK_REWARD and not (long_size > 0) and macd_golden_cross:
+                        if lower_touch_prev and lower_reject_now and risk_reward >= MIN_RISK_REWARD and not (long_size > 0) and macd_golden_cross:
                             ok = place_market_order(symbol, 'buy', BUDGET_USDT, position_ratio=0.5)
                             if ok:
                                 log.info(f'{symbol} 震荡市下轨多重确认开多(50%) + MACD金叉 RR={risk_reward:.2f}:1')
                                 notify_event('震荡市确认开多', f'{symbol} 盈亏比={risk_reward:.2f}:1 + MACD金叉')
                                 last_bar_ts[symbol] = cur_bar_ts
-                        elif lower_touch_prev and lower_reject_now and not (long_size > 0):
-                            log.debug(f'{symbol} 下轨信号但未通过确认: hammer={has_hammer} RR={risk_reward:.2f}')
                         
                         # === 上轨平多 ===
                         if long_size > 0 and price >= curr_upper * (1 - PRICE_TOLERANCE):
@@ -978,8 +976,6 @@ while True:
                         upper_touch_prev = (prev_close >= curr_upper * (1 - PRICE_TOLERANCE))
                         upper_reject_now = (price < curr_upper * (1 - PRICE_TOLERANCE))
                         
-                        # K线形态：流星线
-                        has_star = check_shooting_star_pattern(ohlcv, -1) or check_shooting_star_pattern(ohlcv, -2)
                         
                         # 盈亏比确认（空头）
                         entry_est_s = price
@@ -987,14 +983,12 @@ while True:
                         stop_est_s = curr_upper + (SL_ATR_MULTIPLIER * curr_atr)
                         risk_reward_s = calculate_risk_reward(entry_est_s, target_est_s, stop_est_s)
                         
-                        if upper_touch_prev and upper_reject_now and has_star and risk_reward_s >= MIN_RISK_REWARD and not (short_size > 0) and macd_dead_cross:
+                        if upper_touch_prev and upper_reject_now and risk_reward_s >= MIN_RISK_REWARD and not (short_size > 0) and macd_dead_cross:
                             ok = place_market_order(symbol, 'sell', BUDGET_USDT, position_ratio=0.5)
                             if ok:
                                 log.info(f'{symbol} 震荡市上轨多重确认开空(50%) + MACD死叉 RR={risk_reward_s:.2f}:1')
                                 notify_event('震荡市确认开空', f'{symbol} 盈亏比={risk_reward_s:.2f}:1 + MACD死叉')
                                 last_bar_ts[symbol] = cur_bar_ts
-                        elif upper_touch_prev and upper_reject_now and not (short_size > 0):
-                            log.debug(f'{symbol} 上轨信号但未通过确认: star={has_star} RR={risk_reward_s:.2f}')
                         
                         # === 下轨平空 ===
                         if short_size > 0 and price <= curr_lower * (1 + PRICE_TOLERANCE):
