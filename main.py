@@ -109,7 +109,7 @@ DEFAULT_LEVERAGE = int(float(os.environ.get('DEFAULT_LEVERAGE', '20').strip() or
 # 动态止损使用ATR倍数，固定止盈作为兜底
 TP_PCT = float(os.environ.get('TP_PCT', '0.035').strip() or 0.035)  # 3.5% 兜底止盈
 SL_ATR_MULTIPLIER = float(os.environ.get('SL_ATR_MULTIPLIER', '2.0').strip() or 2.0)  # ATR止损倍数
-SCAN_INTERVAL = int(float(os.environ.get('SCAN_INTERVAL', '10').strip() or 10))
+SCAN_INTERVAL = int(float(os.environ.get('SCAN_INTERVAL', '60').strip() or 60))
 USE_BALANCE_AS_MARGIN = os.environ.get('USE_BALANCE_AS_MARGIN', 'true').strip().lower() in ('1', 'true', 'yes')
 MARGIN_UTILIZATION = float(os.environ.get('MARGIN_UTILIZATION', '0.95').strip() or 0.95)
 # 峰值追踪止盈配置
@@ -128,7 +128,7 @@ ADX_MIN_TREND = float(os.environ.get('ADX_MIN_TREND', '15').strip() or 15)
 ATR_PERIOD = int(os.environ.get('ATR_PERIOD', '14').strip() or 14)
 
 # 趋势判断阈值
-SLOPE_UP_THRESH = float(os.environ.get('SLOPE_UP_THRESH', '0.0008').strip() or 0.0008)
+SLOPE_UP_THRESH = float(os.environ.get('SLOPE_UP_THRESH', '0.0003').strip() or 0.0003)
 SLOPE_DOWN_THRESH = float(os.environ.get('SLOPE_DOWN_THRESH', '-0.0015').strip() or -0.0015)
 SLOPE_FLAT_RANGE = float(os.environ.get('SLOPE_FLAT_RANGE', '0.0008').strip() or 0.0008)
 
@@ -550,9 +550,12 @@ while True:
                 adx = calc_adx(highs, lows, closes, ADX_PERIOD)
                 macd_line, macd_signal, macd_hist = calc_macd(closes, fast=6, slow=16, signal=9)
                 
-                # 判断趋势和带宽状态
+                # 判断趋势和带宽状态 + 调试输出
                 trend = detect_bb_trend(middle, BB_SLOPE_PERIOD)
                 bandwidth_status = detect_bandwidth_change(bandwidth, BB_SLOPE_PERIOD)
+                slope_dbg = (middle.iloc[-1] - middle.iloc[-BB_SLOPE_PERIOD-1]) / middle.iloc[-BB_SLOPE_PERIOD-1] if len(middle) > BB_SLOPE_PERIOD + 1 and middle.iloc[-BB_SLOPE_PERIOD-1] != 0 else 0.0
+                macd_cross = 'golden' if macd_golden_cross else ('dead' if macd_dead_cross else 'none')
+                log.info(f'{symbol} 趋势检测: slope={slope_dbg:.4%}, trend={trend}, bw={bandwidth_status}, adx={adx_last:.1f}, macd_cross={macd_cross}')
                 
                 # 获取当前价格和指标值
                 price = float(closes.iloc[-1])
@@ -866,11 +869,16 @@ while True:
                 # ========== 中线向上策略 ==========
                 if trend == 'up':
                     # 回踩中轨开多（叠加MACD金叉过滤）
-                    if price <= curr_middle * (1 + PRICE_TOLERANCE) and not (long_size > 0) and macd_golden_cross:
-                        ok = place_market_order(symbol, 'buy', BUDGET_USDT)
-                        if ok:
-                            log.info(f'{symbol} 上升趋势回踩中轨开多 + MACD金叉')
-                            last_bar_ts[symbol] = cur_bar_ts
+                    if price <= curr_middle * (1 + PRICE_TOLERANCE) and not (long_size > 0):
+                        # 放宽条件：MACD 金叉 OR ADX 显示趋势增强 都可触发
+                        if macd_golden_cross or adx_last > max(ADX_MIN_TREND, 12):
+                            log.info(f'{symbol} 开仓条件满足 (up)：price={price:.6f}, mid={curr_middle:.6f}, macd={macd_golden_cross}, adx={adx_last:.1f}')
+                            ok = place_market_order(symbol, 'buy', BUDGET_USDT)
+                            if ok:
+                                log.info(f'{symbol} 上升趋势回踩中轨开多（放宽）')
+                                last_bar_ts[symbol] = cur_bar_ts
+                        else:
+                            log.debug(f'{symbol} 上升趋势未触发开仓: macd={macd_golden_cross}, adx={adx_last:.1f}')
                     
                     # 开口向上 + 已有多头 -> 加仓
                     if bandwidth_status == 'expanding' and long_size > 0:
@@ -945,12 +953,17 @@ while True:
                         stop_est = curr_lower - (SL_ATR_MULTIPLIER * curr_atr)
                         risk_reward = calculate_risk_reward(entry_est, target_est, stop_est)
                         
-                        if lower_touch_prev and lower_reject_now and risk_reward >= MIN_RISK_REWARD and not (long_size > 0) and macd_golden_cross:
-                            ok = place_market_order(symbol, 'buy', BUDGET_USDT, position_ratio=0.5)
-                            if ok:
-                                log.info(f'{symbol} 震荡市下轨多重确认开多(50%) + MACD金叉 RR={risk_reward:.2f}:1')
-                                notify_event('震荡市确认开多', f'{symbol} 盈亏比={risk_reward:.2f}:1 + MACD金叉')
-                                last_bar_ts[symbol] = cur_bar_ts
+                        # 暂时放宽：允许没有 hammer 或较低 RR 的机会（用于测试）
+                        if lower_touch_prev and lower_reject_now and not (long_size > 0):
+                            # 先 log 出详细信息，便于调试
+                            log.info(f'{symbol} 震荡检测 下轨: prev_touch={lower_touch_prev} reject_now={lower_reject_now} hammer={has_hammer} RR={risk_reward:.2f} macd={macd_golden_cross}')
+                            # 条件：(原条件) 或 (放宽条件：有 MACD 或 RR>=1.0)
+                            if (risk_reward >= MIN_RISK_REWARD and macd_golden_cross) or (macd_golden_cross or risk_reward >= 1.0):
+                                ok = place_market_order(symbol, 'buy', BUDGET_USDT, position_ratio=0.5)
+                                if ok:
+                                    log.info(f'{symbol} 震荡市下轨开多（放宽） RR={risk_reward:.2f}')
+                                    notify_event('震荡市确认开多', f'{symbol} 盈亏比={risk_reward:.2f}:1 + MACD/放宽条件')
+                                    last_bar_ts[symbol] = cur_bar_ts
                         
                         # === 上轨平多 ===
                         if long_size > 0 and price >= curr_upper * (1 - PRICE_TOLERANCE):
@@ -983,12 +996,16 @@ while True:
                         stop_est_s = curr_upper + (SL_ATR_MULTIPLIER * curr_atr)
                         risk_reward_s = calculate_risk_reward(entry_est_s, target_est_s, stop_est_s)
                         
-                        if upper_touch_prev and upper_reject_now and risk_reward_s >= MIN_RISK_REWARD and not (short_size > 0) and macd_dead_cross:
-                            ok = place_market_order(symbol, 'sell', BUDGET_USDT, position_ratio=0.5)
-                            if ok:
-                                log.info(f'{symbol} 震荡市上轨多重确认开空(50%) + MACD死叉 RR={risk_reward_s:.2f}:1')
-                                notify_event('震荡市确认开空', f'{symbol} 盈亏比={risk_reward_s:.2f}:1 + MACD死叉')
-                                last_bar_ts[symbol] = cur_bar_ts
+                        # 暂时放宽：允许没有 shooting star 或较低 RR 的机会（用于测试）
+                        if upper_touch_prev and upper_reject_now and not (short_size > 0):
+                            log.info(f'{symbol} 震荡检测 上轨: prev_touch={upper_touch_prev} reject_now={upper_reject_now} RR={risk_reward_s:.2f} macd_dead={macd_dead_cross}')
+                            # 条件：(原条件) 或 (放宽条件：MACD死叉 或 RR>=1.0)
+                            if (risk_reward_s >= MIN_RISK_REWARD and macd_dead_cross) or (macd_dead_cross or risk_reward_s >= 1.0):
+                                ok = place_market_order(symbol, 'sell', BUDGET_USDT, position_ratio=0.5)
+                                if ok:
+                                    log.info(f'{symbol} 震荡市上轨开空（放宽） RR={risk_reward_s:.2f}')
+                                    notify_event('震荡市确认开空', f'{symbol} 盈亏比={risk_reward_s:.2f}:1 + MACD/放宽条件')
+                                    last_bar_ts[symbol] = cur_bar_ts
                         
                         # === 下轨平空 ===
                         if short_size > 0 and price <= curr_lower * (1 + PRICE_TOLERANCE):
