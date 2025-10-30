@@ -550,12 +550,6 @@ while True:
                 adx = calc_adx(highs, lows, closes, ADX_PERIOD)
                 macd_line, macd_signal, macd_hist = calc_macd(closes, fast=6, slow=16, signal=9)
                 
-                # 判断趋势和带宽状态 + 调试输出
-                trend = detect_bb_trend(middle, BB_SLOPE_PERIOD)
-                bandwidth_status = detect_bandwidth_change(bandwidth, BB_SLOPE_PERIOD)
-                slope_dbg = (middle.iloc[-1] - middle.iloc[-BB_SLOPE_PERIOD-1]) / middle.iloc[-BB_SLOPE_PERIOD-1] if len(middle) > BB_SLOPE_PERIOD + 1 and middle.iloc[-BB_SLOPE_PERIOD-1] != 0 else 0.0
-                macd_cross = 'golden' if macd_golden_cross else ('dead' if macd_dead_cross else 'none')
-                log.info(f'{symbol} 趋势检测: slope={slope_dbg:.4%}, trend={trend}, bw={bandwidth_status}, adx={adx_last:.1f}, macd_cross={macd_cross}')
                 
                 # 获取当前价格和指标值
                 price = float(closes.iloc[-1])
@@ -572,7 +566,14 @@ while True:
                 macd_sig_prev = float(macd_signal.iloc[-2]) if len(macd_signal) >= 2 else 0.0
                 macd_golden_cross = macd_prev <= macd_sig_prev and macd > macd_sig
                 macd_dead_cross = macd_prev >= macd_sig_prev and macd < macd_sig
-                
+
+                # 判断趋势和带宽状态 + 调试输出（移至此处，确保已计算好 macd 与 adx）
+                trend = detect_bb_trend(middle, BB_SLOPE_PERIOD)
+                bandwidth_status = detect_bandwidth_change(bandwidth, BB_SLOPE_PERIOD)
+                slope_dbg = (middle.iloc[-1] - middle.iloc[-BB_SLOPE_PERIOD-1]) / middle.iloc[-BB_SLOPE_PERIOD-1] if len(middle) > BB_SLOPE_PERIOD + 1 and middle.iloc[-BB_SLOPE_PERIOD-1] != 0 else 0.0
+                macd_cross = 'golden' if macd_golden_cross else ('dead' if macd_dead_cross else 'none')
+                log.info(f'{symbol} 趋势检测: slope={slope_dbg:.4%}, trend={trend}, bw={bandwidth_status}, adx={adx_last:.1f}, macd_cross={macd_cross}')
+
                 # 更新状态
                 prev_state = symbol_state[symbol]
                 upper_run = (prev_state.get('upper_run', 0) + 1) if price >= curr_upper * (1 - PRICE_TOLERANCE) else 0
