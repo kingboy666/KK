@@ -109,7 +109,7 @@ DEFAULT_LEVERAGE = int(float(os.environ.get('DEFAULT_LEVERAGE', '20').strip() or
 # 动态止损使用ATR倍数，固定止盈作为兜底
 TP_PCT = float(os.environ.get('TP_PCT', '0.035').strip() or 0.035)  # 3.5% 兜底止盈
 SL_ATR_MULTIPLIER = float(os.environ.get('SL_ATR_MULTIPLIER', '2.0').strip() or 2.0)  # ATR止损倍数
-SCAN_INTERVAL = int(float(os.environ.get('SCAN_INTERVAL', '60').strip() or 60))
+SCAN_INTERVAL = int(float(os.environ.get('SCAN_INTERVAL', '30').strip() or 30))
 USE_BALANCE_AS_MARGIN = os.environ.get('USE_BALANCE_AS_MARGIN', 'true').strip().lower() in ('1', 'true', 'yes')
 MARGIN_UTILIZATION = float(os.environ.get('MARGIN_UTILIZATION', '0.95').strip() or 0.95)
 # 峰值追踪止盈配置
@@ -123,13 +123,13 @@ BB_STD = float(os.environ.get('BB_STD', '2.5').strip() or 2.5)
 BB_SLOPE_PERIOD = int(os.environ.get('BB_SLOPE_PERIOD', '5').strip() or 5)
 # ADX 过滤参数
 ADX_PERIOD = int(os.environ.get('ADX_PERIOD', '14').strip() or 14)
-ADX_MIN_TREND = float(os.environ.get('ADX_MIN_TREND', '15').strip() or 15)
+ADX_MIN_TREND = float(os.environ.get('ADX_MIN_TREND', '10').strip() or 10)
 # ATR 参数
 ATR_PERIOD = int(os.environ.get('ATR_PERIOD', '14').strip() or 14)
 
 # 趋势判断阈值
 SLOPE_UP_THRESH = float(os.environ.get('SLOPE_UP_THRESH', '0.0003').strip() or 0.0003)
-SLOPE_DOWN_THRESH = float(os.environ.get('SLOPE_DOWN_THRESH', '-0.0015').strip() or -0.0015)
+SLOPE_DOWN_THRESH = float(os.environ.get('SLOPE_DOWN_THRESH', '-0.0008').strip() or -0.0008)
 SLOPE_FLAT_RANGE = float(os.environ.get('SLOPE_FLAT_RANGE', '0.0008').strip() or 0.0008)
 
 # 带宽变化阈值
@@ -858,9 +858,10 @@ while True:
                         last_bar_ts[symbol] = cur_bar_ts
                         continue
                 
-                # 避免同一K线重复操作
-                if acted_key == cur_bar_ts:
-                    log.debug(f'{symbol} 该K线已处理过，跳过')
+                # 避免同一K线重复操作（仅在临近K线收盘时才限制一次）
+                now_ts = time.time()
+                if acted_key == cur_bar_ts and (now_ts - cur_bar_ts/1000) > 30:
+                    log.debug(f'{symbol} 该K线已处理过，且已接近收盘，跳过')
                     continue
                 
                 # ADX 震荡过滤
@@ -872,7 +873,7 @@ while True:
                     # 回踩中轨开多（叠加MACD金叉过滤）
                     if price <= curr_middle * (1 + PRICE_TOLERANCE) and not (long_size > 0):
                         # 放宽条件：MACD 金叉 OR ADX 显示趋势增强 都可触发
-                        if macd_golden_cross or adx_last > max(ADX_MIN_TREND, 12):
+                        if macd_golden_cross or adx_last >= 10:
                             log.info(f'{symbol} 开仓条件满足 (up)：price={price:.6f}, mid={curr_middle:.6f}, macd={macd_golden_cross}, adx={adx_last:.1f}')
                             ok = place_market_order(symbol, 'buy', BUDGET_USDT)
                             if ok:
