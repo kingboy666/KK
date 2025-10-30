@@ -867,20 +867,76 @@ while True:
                 # ADX 震荡过滤
                 if trend == 'flat' and adx_last < ADX_MIN_TREND:
                     log.debug(f"{symbol} ADX过低({adx_last:.1f})，震荡期需额外确认")
-                
+
+                # ========== MACD 主策略（6,16,9）优先 ==========
+                # 1) 反向信号先行：若持有多/空且出现相反信号，优先止损/止盈离场，减少亏损拖延
+                if long_size > 0 and macd_dead_cross:
+                    try:
+                        close_price = float(exchange.fetch_ticker(symbol)['last'] or 0)
+                        ct_val = float(load_market_info(symbol).get('ctVal') or 0)
+                    except Exception:
+                        close_price, ct_val = 0.0, 0.0
+                    realized = long_size * ct_val * (close_price - long_entry)
+                    ok = close_position_market(symbol, 'long', long_size)
+                    if ok:
+                        stats['trades'] += 1
+                        if realized > 0:
+                            stats['wins'] += 1
+                        else:
+                            stats['losses'] += 1
+                        stats['realized_pnl'] += realized
+                        log.info(f'{symbol} MACD死叉平多: 已实现={realized:.2f} | 累计={stats["realized_pnl"]:.2f}')
+                        notify_event('MACD死叉平多', f'{symbol} 已实现={realized:.2f} 累计={stats["realized_pnl"]:.2f}')
+                        last_bar_ts[symbol] = cur_bar_ts
+                        continue
+                if short_size > 0 and macd_golden_cross:
+                    try:
+                        close_price = float(exchange.fetch_ticker(symbol)['last'] or 0)
+                        ct_val = float(load_market_info(symbol).get('ctVal') or 0)
+                    except Exception:
+                        close_price, ct_val = 0.0, 0.0
+                    realized = short_size * ct_val * (short_entry - close_price)
+                    ok = close_position_market(symbol, 'short', short_size)
+                    if ok:
+                        stats['trades'] += 1
+                        if realized > 0:
+                            stats['wins'] += 1
+                        else:
+                            stats['losses'] += 1
+                        stats['realized_pnl'] += realized
+                        log.info(f'{symbol} MACD金叉平空: 已实现={realized:.2f} | 累计={stats["realized_pnl"]:.2f}')
+                        notify_event('MACD金叉平空', f'{symbol} 已实现={realized:.2f} 累计={stats["realized_pnl"]:.2f}')
+                        last_bar_ts[symbol] = cur_bar_ts
+                        continue
+
+                # 2) 开仓：以 MACD 为主，其他指标仅作辅助过滤（尽量宽松以提高触发）
+                if macd_golden_cross and long_size <= 0:
+                    # 辅助：若价格远低于中轨，允许提前介入；若带宽极度收口，可适度观望，但默认放行
+                    ok = place_market_order(symbol, 'buy', BUDGET_USDT)
+                    if ok:
+                        log.info(f'{symbol} MACD金叉开多')
+                        notify_event('MACD金叉开多', f'{symbol} price={price:.6f}, adx={adx_last:.1f}')
+                        last_bar_ts[symbol] = cur_bar_ts
+                        continue
+                if macd_dead_cross and short_size <= 0:
+                    ok = place_market_order(symbol, 'sell', BUDGET_USDT)
+                    if ok:
+                        log.info(f'{symbol} MACD死叉开空')
+                        notify_event('MACD死叉开空', f'{symbol} price={price:.6f}, adx={adx_last:.1f}')
+                        last_bar_ts[symbol] = cur_bar_ts
+                        continue
+
                 # ========== 中线向上策略 ==========
                 if trend == 'up':
-                    # 回踩中轨开多（叠加MACD金叉过滤）
+                    # 回踩中轨开多（保留为次要触发，仍需MACD为主）
                     if price <= curr_middle * (1 + PRICE_TOLERANCE) and not (long_size > 0):
-                        # 放宽条件：MACD 金叉 OR ADX 显示趋势增强 都可触发
-                        if macd_golden_cross or adx_last >= 10:
-                            log.info(f'{symbol} 开仓条件满足 (up)：price={price:.6f}, mid={curr_middle:.6f}, macd={macd_golden_cross}, adx={adx_last:.1f}')
+                        if macd_golden_cross:
+                            log.info(f'{symbol} (up) 回踩中轨 + MACD金叉 -> 开多')
                             ok = place_market_order(symbol, 'buy', BUDGET_USDT)
                             if ok:
-                                log.info(f'{symbol} 上升趋势回踩中轨开多（放宽）')
                                 last_bar_ts[symbol] = cur_bar_ts
                         else:
-                            log.debug(f'{symbol} 上升趋势未触发开仓: macd={macd_golden_cross}, adx={adx_last:.1f}')
+                            log.debug(f'{symbol} (up) 回踩中轨但无MACD金叉，跳过')
                     
                     # 开口向上 + 已有多头 -> 加仓
                     if bandwidth_status == 'expanding' and long_size > 0:
