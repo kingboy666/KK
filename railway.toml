@@ -6,7 +6,7 @@ builder = "nixpacks"
 # 部署与服务配置
 [[services]]
 name = "okx-macd-bot"
-start = "python -u main.py"
+start = "python main.py"
 restartPolicy = "always"
 
 # 默认环境变量（可被 Railway Variables 面板覆盖）
