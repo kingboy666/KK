@@ -1015,12 +1015,12 @@ while True:
                         if lower_touch_prev and lower_reject_now and not (long_size > 0):
                             # 先 log 出详细信息，便于调试
                             log.info(f'{symbol} 震荡检测 下轨: prev_touch={lower_touch_prev} reject_now={lower_reject_now} hammer={has_hammer} RR={risk_reward:.2f} macd={macd_golden_cross}')
-                            # 条件：(原条件) 或 (放宽条件：有 MACD 或 RR>=1.0)
-                            if (risk_reward >= MIN_RISK_REWARD and macd_golden_cross) or (macd_golden_cross or risk_reward >= 1.0):
+                            # 条件：必须 MACD 金叉（主信号），RR 仅记录不做硬限制
+                            if macd_golden_cross:
                                 ok = place_market_order(symbol, 'buy', BUDGET_USDT, position_ratio=0.5)
                                 if ok:
-                                    log.info(f'{symbol} 震荡市下轨开多（放宽） RR={risk_reward:.2f}')
-                                    notify_event('震荡市确认开多', f'{symbol} 盈亏比={risk_reward:.2f}:1 + MACD/放宽条件')
+                                    log.info(f'{symbol} 震荡市下轨开多（MACD主导） RR={risk_reward:.2f}')
+                                    notify_event('震荡市确认开多', f'{symbol} MACD金叉 + RR={risk_reward:.2f}:1')
                                     last_bar_ts[symbol] = cur_bar_ts
                         
                         # === 上轨平多 ===
@@ -1057,12 +1057,12 @@ while True:
                         # 暂时放宽：允许没有 shooting star 或较低 RR 的机会（用于测试）
                         if upper_touch_prev and upper_reject_now and not (short_size > 0):
                             log.info(f'{symbol} 震荡检测 上轨: prev_touch={upper_touch_prev} reject_now={upper_reject_now} RR={risk_reward_s:.2f} macd_dead={macd_dead_cross}')
-                            # 条件：(原条件) 或 (放宽条件：MACD死叉 或 RR>=1.0)
-                            if (risk_reward_s >= MIN_RISK_REWARD and macd_dead_cross) or (macd_dead_cross or risk_reward_s >= 1.0):
+                            # 条件：必须 MACD 死叉（主信号），RR 仅记录不做硬限制
+                            if macd_dead_cross:
                                 ok = place_market_order(symbol, 'sell', BUDGET_USDT, position_ratio=0.5)
                                 if ok:
-                                    log.info(f'{symbol} 震荡市上轨开空（放宽） RR={risk_reward_s:.2f}')
-                                    notify_event('震荡市确认开空', f'{symbol} 盈亏比={risk_reward_s:.2f}:1 + MACD/放宽条件')
+                                    log.info(f'{symbol} 震荡市上轨开空（MACD主导） RR={risk_reward_s:.2f}')
+                                    notify_event('震荡市确认开空', f'{symbol} MACD死叉 + RR={risk_reward_s:.2f}:1')
                                     last_bar_ts[symbol] = cur_bar_ts
                         
                         # === 下轨平空 ===
