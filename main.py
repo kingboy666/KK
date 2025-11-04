@@ -927,7 +927,7 @@ while True:
 
                 # 2) 开仓：严格按你的规则
                 # 多头开仓：MACD金叉 + 柱状图转正 + KDJ金叉且K、D<50 + 收盘价>EMA20
-                if (macd_golden_cross and macd_hist_turn_pos and kdj_golden and kdj_low_zone and price > ema20_last) and long_size <= 0:
+                if (macd_golden_cross and macd_hist_turn_pos and kdj_golden and kdj_low_zone) and long_size <= 0:
                     ok = place_market_order(symbol, 'buy', BUDGET_USDT)
                     if ok:
                         log.info(f'{symbol} 多头开仓: MACD金叉&柱转正 + KDJ金叉&低位 + 收盘>EMA20')
@@ -935,7 +935,7 @@ while True:
                         last_bar_ts[symbol] = cur_bar_ts
                         continue
                 # 空头开仓：MACD死叉 + 柱状图转负 + KDJ死叉且K、D>50 + 收盘价<EMA20
-                if (macd_dead_cross and macd_hist_turn_neg and kdj_dead and kdj_high_zone and price < ema20_last) and short_size <= 0:
+                if (macd_dead_cross and macd_hist_turn_neg and kdj_dead and kdj_high_zone) and short_size <= 0:
                     ok = place_market_order(symbol, 'sell', BUDGET_USDT)
                     if ok:
                         log.info(f'{symbol} 空头开仓: MACD死叉&柱转负 + KDJ死叉&高位 + 收盘<EMA20')
@@ -945,23 +945,13 @@ while True:
 
                 # ========== 中线向上策略 ==========
                 if trend == 'up':
-                    # 回踩中轨开多（保留为次要触发，仍需MACD为主）
-                    if price <= curr_middle * (1 + PRICE_TOLERANCE) and not (long_size > 0):
-                        if macd_golden_cross:
-                            log.info(f'{symbol} (up) 回踩中轨 + MACD金叉 -> 开多')
-                            ok = place_market_order(symbol, 'buy', BUDGET_USDT)
-                            if ok:
-                                last_bar_ts[symbol] = cur_bar_ts
-                        else:
-                            log.debug(f'{symbol} (up) 回踩中轨但无MACD金叉，跳过')
+                    # 已禁用：趋势回踩中轨开多（仅使用 MACD+KDJ 做单策略）
+                    pass
                     
                     # 开口向上 + 已有多头 -> 加仓
-                    if bandwidth_status == 'expanding' and long_size > 0:
-                        ok = place_market_order(symbol, 'buy', BUDGET_USDT, position_ratio=0.3)
-                        if ok:
-                            log.info(f'{symbol} 开口向上加仓多头30%')
-                            notify_event('开口向上加仓', f'{symbol} 追加30%')
-                            last_bar_ts[symbol] = cur_bar_ts
+                    # 已禁用：开口向上加仓（仅使用 MACD+KDJ 做单策略）
+                    if False and bandwidth_status == 'expanding' and long_size > 0:
+                        pass
                     
                     # 开口向上 + 持空仓 -> 紧急平空
                     if bandwidth_status == 'expanding' and short_size > 0:
@@ -1003,104 +993,13 @@ while True:
                             last_bar_ts[symbol] = cur_bar_ts
                     
                     # 抢反弹（高风险，默认禁用）
-                    if ENABLE_DOWNTREND_BOUNCE and price <= curr_lower * (1 + PRICE_TOLERANCE) and not (long_size > 0):
-                        ok = place_market_order(symbol, 'buy', BUDGET_USDT, position_ratio=DOWNTREND_POSITION_RATIO)
-                        if ok:
-                            log.info(f'{symbol} 下降趋势下轨抢反弹（{DOWNTREND_POSITION_RATIO*100:.0f}%）')
-                            notify_event('抢反弹开仓', f'{symbol} 下轨 {DOWNTREND_POSITION_RATIO*100:.0f}%仓')
-                            last_bar_ts[symbol] = cur_bar_ts
+                    # 已禁用：下降趋势下轨抢反弹（仅使用 MACD+KDJ 做单策略）
+                    if False and ENABLE_DOWNTREND_BOUNCE and price <= curr_lower * (1 + PRICE_TOLERANCE) and not (long_size > 0):
+                        pass
                 
-                # ========== 震荡市策略（多重确认） ==========
+                # ========== 震荡市策略：已禁用（仅使用 MACD+KDJ 做单策略） ==========
                 elif trend == 'flat':
-                    is_flat_env = (adx_last < ADX_MIN_TREND and bandwidth_status in ('stable', 'squeezing'))
-                    
-                    if is_flat_env:
-                        # === 下轨开多：3重确认 ===
-                        lower_touch_prev = (prev_close <= curr_lower * (1 + PRICE_TOLERANCE))
-                        lower_reject_now = (price > curr_lower * (1 + PRICE_TOLERANCE))
-                        
-                        # K线形态确认：锤子线
-                        has_hammer = check_hammer_pattern(ohlcv, -1) or check_hammer_pattern(ohlcv, -2)
-                        
-                        # 盈亏比确认
-                        entry_est = price
-                        target_est = curr_upper
-                        stop_est = curr_lower - (SL_ATR_MULTIPLIER * curr_atr)
-                        risk_reward = calculate_risk_reward(entry_est, target_est, stop_est)
-                        
-                        # 暂时放宽：允许没有 hammer 或较低 RR 的机会（用于测试）
-                        if lower_touch_prev and lower_reject_now and not (long_size > 0):
-                            # 先 log 出详细信息，便于调试
-                            log.info(f'{symbol} 震荡检测 下轨: prev_touch={lower_touch_prev} reject_now={lower_reject_now} hammer={has_hammer} RR={risk_reward:.2f} macd={macd_golden_cross}')
-                            # 条件：必须 MACD 金叉（主信号），RR 仅记录不做硬限制
-                            if macd_golden_cross:
-                                ok = place_market_order(symbol, 'buy', BUDGET_USDT, position_ratio=0.5)
-                                if ok:
-                                    log.info(f'{symbol} 震荡市下轨开多（MACD主导） RR={risk_reward:.2f}')
-                                    notify_event('震荡市确认开多', f'{symbol} MACD金叉 + RR={risk_reward:.2f}:1')
-                                    last_bar_ts[symbol] = cur_bar_ts
-                        
-                        # === 上轨平多 ===
-                        if long_size > 0 and price >= curr_upper * (1 - PRICE_TOLERANCE):
-                            try:
-                                close_price = float(exchange.fetch_ticker(symbol)['last'] or 0)
-                                ct_val = float(load_market_info(symbol).get('ctVal') or 0)
-                            except Exception:
-                                close_price, ct_val = 0.0, 0.0
-                            realized = long_size * ct_val * (close_price - long_entry)
-                            ok = close_position_market(symbol, 'long', long_size)
-                            if ok:
-                                stats['trades'] += 1
-                                if realized > 0:
-                                    stats['wins'] += 1
-                                else:
-                                    stats['losses'] += 1
-                                stats['realized_pnl'] += realized
-                                log.info(f'{symbol} 震荡市上轨平多: 已实现={realized:.2f} | 累计={stats["realized_pnl"]:.2f}')
-                                notify_event('震荡市平多', f'{symbol} 已实现={realized:.2f} 累计={stats["realized_pnl"]:.2f}')
-                                last_bar_ts[symbol] = cur_bar_ts
-                        
-                        # === 上轨开空：3重确认 ===
-                        upper_touch_prev = (prev_close >= curr_upper * (1 - PRICE_TOLERANCE))
-                        upper_reject_now = (price < curr_upper * (1 - PRICE_TOLERANCE))
-                        
-                        
-                        # 盈亏比确认（空头）
-                        entry_est_s = price
-                        target_est_s = curr_lower
-                        stop_est_s = curr_upper + (SL_ATR_MULTIPLIER * curr_atr)
-                        risk_reward_s = calculate_risk_reward(entry_est_s, target_est_s, stop_est_s)
-                        
-                        # 暂时放宽：允许没有 shooting star 或较低 RR 的机会（用于测试）
-                        if upper_touch_prev and upper_reject_now and not (short_size > 0):
-                            log.info(f'{symbol} 震荡检测 上轨: prev_touch={upper_touch_prev} reject_now={upper_reject_now} RR={risk_reward_s:.2f} macd_dead={macd_dead_cross}')
-                            # 条件：必须 MACD 死叉（主信号），RR 仅记录不做硬限制
-                            if macd_dead_cross:
-                                ok = place_market_order(symbol, 'sell', BUDGET_USDT, position_ratio=0.5)
-                                if ok:
-                                    log.info(f'{symbol} 震荡市上轨开空（MACD主导） RR={risk_reward_s:.2f}')
-                                    notify_event('震荡市确认开空', f'{symbol} MACD死叉 + RR={risk_reward_s:.2f}:1')
-                                    last_bar_ts[symbol] = cur_bar_ts
-                        
-                        # === 下轨平空 ===
-                        if short_size > 0 and price <= curr_lower * (1 + PRICE_TOLERANCE):
-                            try:
-                                close_price = float(exchange.fetch_ticker(symbol)['last'] or 0)
-                                ct_val = float(load_market_info(symbol).get('ctVal') or 0)
-                            except Exception:
-                                close_price, ct_val = 0.0, 0.0
-                            realized = short_size * ct_val * (short_entry - close_price)
-                            ok = close_position_market(symbol, 'short', short_size)
-                            if ok:
-                                stats['trades'] += 1
-                                if realized > 0:
-                                    stats['wins'] += 1
-                                else:
-                                    stats['losses'] += 1
-                                stats['realized_pnl'] += realized
-                                log.info(f'{symbol} 震荡市下轨平空: 已实现={realized:.2f} | 累计={stats["realized_pnl"]:.2f}')
-                                notify_event('震荡市平空', f'{symbol} 已实现={realized:.2f} 累计={stats["realized_pnl"]:.2f}')
-                                last_bar_ts[symbol] = cur_bar_ts
+                    pass
                 
             except Exception as e:
                 log.warning(f'{symbol} 处理异常: {e}')
