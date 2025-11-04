@@ -548,7 +548,9 @@ while True:
                 upper, middle, lower, bandwidth = calculate_bollinger_bands(closes, BB_PERIOD, BB_STD)
                 atr = calc_atr(highs, lows, closes, ATR_PERIOD)
                 adx = calc_adx(highs, lows, closes, ADX_PERIOD)
-                macd_line, macd_signal, macd_hist = calc_macd(closes, fast=6, slow=16, signal=9)
+                macd_line, macd_signal, macd_hist = calc_macd(closes, fast=14, slow=30, signal=10)
+                ema20 = closes.ewm(span=20, adjust=False).mean()
+                K, D, J = calc_kdj(highs, lows, closes, n=14, k_period=7, d_period=7)
                 
                 
                 # 获取当前价格和指标值
@@ -566,6 +568,20 @@ while True:
                 macd_sig_prev = float(macd_signal.iloc[-2]) if len(macd_signal) >= 2 else 0.0
                 macd_golden_cross = macd_prev <= macd_sig_prev and macd > macd_sig
                 macd_dead_cross = macd_prev >= macd_sig_prev and macd < macd_sig
+                macd_hist_prev = float(macd_hist.iloc[-2]) if len(macd_hist) >= 2 else 0.0
+                macd_hist_turn_pos = (macd_hist_prev <= 0 and macd_hist.iloc[-1] > 0)
+                macd_hist_turn_neg = (macd_hist_prev >= 0 and macd_hist.iloc[-1] < 0)
+
+                # KDJ 金叉/死叉与阈值
+                K_last = float(K.iloc[-1]); D_last = float(D.iloc[-1])
+                K_prev = float(K.iloc[-2]) if len(K) >= 2 else K_last
+                D_prev = float(D.iloc[-2]) if len(D) >= 2 else D_last
+                kdj_golden = (K_prev <= D_prev and K_last > D_last)
+                kdj_dead = (K_prev >= D_prev and K_last < D_last)
+                kdj_low_zone = (K_last < 50 and D_last < 50)
+                kdj_high_zone = (K_last > 50 and D_last > 50)
+
+                ema20_last = float(ema20.iloc[-1])
 
                 # 判断趋势和带宽状态 + 调试输出（移至此处，确保已计算好 macd 与 adx）
                 trend = detect_bb_trend(middle, BB_SLOPE_PERIOD)
@@ -909,20 +925,21 @@ while True:
                         last_bar_ts[symbol] = cur_bar_ts
                         continue
 
-                # 2) 开仓：以 MACD 为主，其他指标仅作辅助过滤（尽量宽松以提高触发）
-                if macd_golden_cross and long_size <= 0:
-                    # 辅助：若价格远低于中轨，允许提前介入；若带宽极度收口，可适度观望，但默认放行
+                # 2) 开仓：严格按你的规则
+                # 多头开仓：MACD金叉 + 柱状图转正 + KDJ金叉且K、D<50 + 收盘价>EMA20
+                if (macd_golden_cross and macd_hist_turn_pos and kdj_golden and kdj_low_zone and price > ema20_last) and long_size <= 0:
                     ok = place_market_order(symbol, 'buy', BUDGET_USDT)
                     if ok:
-                        log.info(f'{symbol} MACD金叉开多')
-                        notify_event('MACD金叉开多', f'{symbol} price={price:.6f}, adx={adx_last:.1f}')
+                        log.info(f'{symbol} 多头开仓: MACD金叉&柱转正 + KDJ金叉&低位 + 收盘>EMA20')
+                        notify_event('多头开仓', f'{symbol} MACD金叉/柱正 KDJ金叉<50 收盘>EMA20')
                         last_bar_ts[symbol] = cur_bar_ts
                         continue
-                if macd_dead_cross and short_size <= 0:
+                # 空头开仓：MACD死叉 + 柱状图转负 + KDJ死叉且K、D>50 + 收盘价<EMA20
+                if (macd_dead_cross and macd_hist_turn_neg and kdj_dead and kdj_high_zone and price < ema20_last) and short_size <= 0:
                     ok = place_market_order(symbol, 'sell', BUDGET_USDT)
                     if ok:
-                        log.info(f'{symbol} MACD死叉开空')
-                        notify_event('MACD死叉开空', f'{symbol} price={price:.6f}, adx={adx_last:.1f}')
+                        log.info(f'{symbol} 空头开仓: MACD死叉&柱转负 + KDJ死叉&高位 + 收盘<EMA20')
+                        notify_event('空头开仓', f'{symbol} MACD死叉/柱负 KDJ死叉>50 收盘<EMA20')
                         last_bar_ts[symbol] = cur_bar_ts
                         continue
 
