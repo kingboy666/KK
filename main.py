@@ -599,7 +599,7 @@ while True:
                 bandwidth_status = detect_bandwidth_change(bandwidth, BB_SLOPE_PERIOD)
                 slope_dbg = (middle.iloc[-1] - middle.iloc[-BB_SLOPE_PERIOD-1]) / middle.iloc[-BB_SLOPE_PERIOD-1] if len(middle) > BB_SLOPE_PERIOD + 1 and middle.iloc[-BB_SLOPE_PERIOD-1] != 0 else 0.0
                 macd_cross = 'golden' if macd_golden_cross else ('dead' if macd_dead_cross else 'none')
-                log.info(f'{symbol} 趋势检测: slope={slope_dbg:.4%}, trend={trend}, bw={bandwidth_status}, adx={adx_last:.1f}, macd_cross={macd_cross}')
+                log.info(f'{symbol} 指标概览: adx={adx_last:.1f}, macd_cross={macd_cross}')
 
                 # 更新状态
                 prev_state = symbol_state[symbol]
@@ -618,7 +618,7 @@ while True:
                 }
                 
                 # 状态变化通知
-                if prev_state.get('trend') != trend or prev_state.get('bandwidth_status') != bandwidth_status:
+                if False and (prev_state.get('trend') != trend or prev_state.get('bandwidth_status') != bandwidth_status):
                     log.info(f'{symbol} 状态变化: 趋势={trend}, 带宽={bandwidth_status}, 价格={price:.6f}, ATR={curr_atr:.6f}')
                 
                 # 获取当前持仓
@@ -715,7 +715,7 @@ while True:
                     
                     # 3. 动态止盈：布林带追踪
                     upper_run = symbol_state.get(symbol, {}).get('upper_run', 0)
-                    if upper_run >= 3:
+                    if False and upper_run >= 3:
                         # 价格连续在上轨运行>=3根K，跌破中轨止盈
                         if price <= curr_middle * (1 - PRICE_TOLERANCE):
                             close_price = price
@@ -733,22 +733,9 @@ while True:
                                 last_bar_ts[symbol] = cur_bar_ts
                                 continue
                     else:
-                        # 常规情况：触及上轨平仓
-                        if price >= curr_upper * (1 - PRICE_TOLERANCE):
-                            close_price = price
-                            realized = long_size * ct_val * (close_price - long_entry)
-                            ok = close_position_market(symbol, 'long', long_size)
-                            if ok:
-                                stats['trades'] += 1
-                                if realized > 0:
-                                    stats['wins'] += 1
-                                else:
-                                    stats['losses'] += 1
-                                stats['realized_pnl'] += realized
-                                log.info(f'{symbol} 触及上轨平仓: 已实现={realized:.2f} | 累计={stats["realized_pnl"]:.2f}')
-                                notify_event('触及上轨平仓', f'{symbol} 已实现={realized:.2f} 累计={stats["realized_pnl"]:.2f}')
-                                last_bar_ts[symbol] = cur_bar_ts
-                                continue
+                        # 已禁用：触及上轨平仓（仅使用 MACD+KDJ 做单策略）
+                        if False and price >= curr_upper * (1 - PRICE_TOLERANCE):
+                            pass
                 
                 # ========== 动态止盈止损监控（空头） ==========
                 if short_size > 0 and short_entry > 0 and price > 0:
@@ -826,7 +813,7 @@ while True:
                     
                     # 3. 动态止盈：布林带追踪
                     lower_run = symbol_state.get(symbol, {}).get('lower_run', 0)
-                    if lower_run >= 3:
+                    if False and lower_run >= 3:
                         if price >= curr_middle * (1 + PRICE_TOLERANCE):
                             close_price = price
                             realized = short_size * ct_val * (short_entry - close_price)
@@ -843,29 +830,17 @@ while True:
                                 last_bar_ts[symbol] = cur_bar_ts
                                 continue
                     else:
-                        if price <= curr_lower * (1 + PRICE_TOLERANCE):
-                            close_price = price
-                            realized = short_size * ct_val * (short_entry - close_price)
-                            ok = close_position_market(symbol, 'short', short_size)
-                            if ok:
-                                stats['trades'] += 1
-                                if realized > 0:
-                                    stats['wins'] += 1
-                                else:
-                                    stats['losses'] += 1
-                                stats['realized_pnl'] += realized
-                                log.info(f'{symbol} 触及下轨平空: 已实现={realized:.2f} | 累计={stats["realized_pnl"]:.2f}')
-                                notify_event('触及下轨平空', f'{symbol} 已实现={realized:.2f} 累计={stats["realized_pnl"]:.2f}')
-                                last_bar_ts[symbol] = cur_bar_ts
-                                continue
+                        # 已禁用：触及下轨平空（仅使用 MACD+KDJ 做单策略）
+                        if False and price <= curr_lower * (1 + PRICE_TOLERANCE):
+                            pass
                 
                 # ========== 收口观望 ==========
-                if bandwidth_status == 'squeezing':
+                if False and bandwidth_status == 'squeezing':
                     log.debug(f'{symbol} 收口阶段，观望等方向')
                     continue
                 
                 # ========== 开口向下 + 持多仓 -> 紧急平仓 ==========
-                if bandwidth_status == 'expanding' and trend == 'down' and long_size > 0:
+                if False and bandwidth_status == 'expanding' and trend == 'down' and long_size > 0:
                     try:
                         close_price = float(exchange.fetch_ticker(symbol)['last'] or 0)
                         ct_val = float(load_market_info(symbol).get('ctVal') or 0)
@@ -965,7 +940,7 @@ while True:
                         pass
                     
                     # 开口向上 + 持空仓 -> 紧急平空
-                    if bandwidth_status == 'expanding' and short_size > 0:
+                    if False and bandwidth_status == 'expanding' and short_size > 0:
                         close_price = float(exchange.fetch_ticker(symbol)['last'] or 0)
                         ct_val = float(load_market_info(symbol).get('ctVal') or 0)
                         realized = short_size * ct_val * (short_entry - close_price)
