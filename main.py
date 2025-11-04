@@ -406,6 +406,17 @@ def calc_macd(closes: pd.Series, fast: int = 6, slow: int = 16, signal: int = 9)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+def calc_kdj(highs: pd.Series, lows: pd.Series, closes: pd.Series, n: int = 14, k_period: int = 7, d_period: int = 7):
+    lowest_low = lows.rolling(window=n, min_periods=n).min()
+    highest_high = highs.rolling(window=n, min_periods=n).max()
+    denom = (highest_high - lowest_low).replace(0, pd.NA)
+    rsv = ((closes - lowest_low) / denom).clip(lower=0, upper=1) * 100
+    rsv = rsv.fillna(50)
+    K = rsv.ewm(span=k_period, adjust=False).mean()
+    D = K.ewm(span=d_period, adjust=False).mean()
+    J = 3 * K - 2 * D
+    return K.fillna(50), D.fillna(50), J.fillna(50)
+
 def detect_bb_trend(middle: pd.Series, lookback: int = 5):
     """判断中线方向：up/down/flat"""
     if len(middle) < lookback + 1:
