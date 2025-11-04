@@ -110,8 +110,8 @@ DEFAULT_LEVERAGE = int(float(os.environ.get('DEFAULT_LEVERAGE', '20').strip() or
 TP_PCT = float(os.environ.get('TP_PCT', '0.035').strip() or 0.035)  # 3.5% 兜底止盈
 SL_ATR_MULTIPLIER = float(os.environ.get('SL_ATR_MULTIPLIER', '2.0').strip() or 2.0)  # ATR止损倍数
 SCAN_INTERVAL = int(float(os.environ.get('SCAN_INTERVAL', '30').strip() or 30))
-USE_BALANCE_AS_MARGIN = os.environ.get('USE_BALANCE_AS_MARGIN', 'true').strip().lower() in ('1', 'true', 'yes')
-MARGIN_UTILIZATION = float(os.environ.get('MARGIN_UTILIZATION', '0.95').strip() or 0.95)
+USE_BALANCE_AS_MARGIN = os.environ.get('USE_BALANCE_AS_MARGIN', 'false').strip().lower() in ('1', 'true', 'yes')
+MARGIN_UTILIZATION = float(os.environ.get('MARGIN_UTILIZATION', '0.5').strip() or 0.5)
 # 峰值追踪止盈配置
 TRAIL_ENABLE = os.environ.get('TRAIL_ENABLE', 'true').strip().lower() in ('1', 'true', 'yes')
 TRAIL_DD_PCT = float(os.environ.get('TRAIL_DD_PCT', '0.05').strip() or 0.05)  # 从峰值回撤阈值（5%）
@@ -286,10 +286,22 @@ def place_market_order(symbol: str, side: str, budget_usdt: float, position_rati
 
     lot = float(info.get('lotSz') or 0)
     minsz = float(info.get('minSz') or 0)
+
+    # 若合约张数不足最小值，则计算达到最小下单所需的最低预算，便于给出明确提示
+    if minsz > 0:
+        if USE_BALANCE_AS_MARGIN:
+            leverage = SYMBOL_LEVERAGE.get(symbol, DEFAULT_LEVERAGE)
+            equity_needed = (minsz * ct_val * price) / (max(1, leverage) * max(1e-6, MARGIN_UTILIZATION))
+        else:
+            equity_needed = (minsz * ct_val * price)
+    else:
+        equity_needed = 0.0
+
     if lot > 0:
         contracts = math.floor(contracts / lot) * lot
+
     if contracts <= 0 or (minsz > 0 and contracts < minsz):
-        log.warning(f'计算得到的合约张数过小: {contracts}, 最小下单={minsz}, 步长={lot}')
+        log.warning(f'计算得到的合约张数过小: {contracts}, 最小下单={minsz}, 步长={lot} | 需要预算≥{equity_needed:.4f} USDT，当前预算={equity_usdt:.4f} USDT')
         return False
     
     side_okx = 'buy' if side == 'buy' else 'sell'
@@ -905,7 +917,7 @@ while True:
                         continue
 
                 # 2) 开仓：严格按你的规则
-                # 多头开仓：MACD金叉 + 柱状图转正 + KDJ金叉且K、D<50 + 收盘价>EMA20
+                # 多头开仓：MACD金叉 + 柱状图转正 + KDJ金叉且K、D<50（MACD与KDJ必须同根K线同时满足）
                 if (macd_golden_cross and macd_hist_turn_pos and kdj_golden and kdj_low_zone) and long_size <= 0:
                     ok = place_market_order(symbol, 'buy', BUDGET_USDT)
                     if ok:
