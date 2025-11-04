@@ -147,7 +147,7 @@ HAMMER_SHADOW_RATIO = float(os.environ.get('HAMMER_SHADOW_RATIO', '2.0').strip()
 ENABLE_DOWNTREND_BOUNCE = os.environ.get('ENABLE_DOWNTREND_BOUNCE', 'true').strip().lower() in ('1', 'true', 'yes')
 DOWNTREND_POSITION_RATIO = float(os.environ.get('DOWNTREND_POSITION_RATIO', '0.3').strip() or 0.3)
 
-TIMEFRAME = '15m'
+TIMEFRAME = '30m'
 SYMBOLS = [
     'FIL/USDT:USDT', 'ZRO/USDT:USDT', 'WIF/USDT:USDT', 'WLD/USDT:USDT',
     'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT',
@@ -261,14 +261,10 @@ def place_market_order(symbol: str, side: str, budget_usdt: float, position_rati
     if DRY_RUN:
         log.info(f'[DRY_RUN] 模拟开仓 {symbol} {side} 仓位比例={position_ratio*100:.0f}%')
         return True
-    try:
-        balance = exchange.fetch_balance()
-        avail = float(balance.get('USDT', {}).get('free') or balance.get('USDT', {}).get('available') or 0)
-    except Exception:
-        avail = 0.0
-    equity_usdt = max(0.0, avail) * position_ratio
+    # 使用调用方给定的预算而非账户可用余额，确保可控下单规模
+    equity_usdt = max(0.0, float(budget_usdt)) * position_ratio
     if equity_usdt <= 0:
-        log.warning('No available USDT balance to open position')
+        log.warning('预算为0，无法下单（请调整 BUDGET_USDT 或 position_ratio）')
         return False
 
     info = load_market_info(symbol)
@@ -599,7 +595,7 @@ while True:
                 bandwidth_status = detect_bandwidth_change(bandwidth, BB_SLOPE_PERIOD)
                 slope_dbg = (middle.iloc[-1] - middle.iloc[-BB_SLOPE_PERIOD-1]) / middle.iloc[-BB_SLOPE_PERIOD-1] if len(middle) > BB_SLOPE_PERIOD + 1 and middle.iloc[-BB_SLOPE_PERIOD-1] != 0 else 0.0
                 macd_cross = 'golden' if macd_golden_cross else ('dead' if macd_dead_cross else 'none')
-                log.info(f'{symbol} 指标概览: adx={adx_last:.1f}, macd_cross={macd_cross}')
+                log.info(f'{symbol} 指标概览: macd_cross={macd_cross}')
 
                 # 更新状态
                 prev_state = symbol_state[symbol]
@@ -866,9 +862,6 @@ while True:
                     log.debug(f'{symbol} 该K线已处理过，且已接近收盘，跳过')
                     continue
                 
-                # ADX 震荡过滤
-                if trend == 'flat' and adx_last < ADX_MIN_TREND:
-                    log.debug(f"{symbol} ADX过低({adx_last:.1f})，震荡期需额外确认")
 
                 # ========== MACD 主策略（6,16,9）优先 ==========
                 # 1) 反向信号先行：若持有多/空且出现相反信号，优先止损/止盈离场，减少亏损拖延
